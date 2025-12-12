@@ -67,7 +67,7 @@ CORS(app, resources={r"/api/.*": {
 
 # База данных и Секреты
 app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///instance/stealthnet.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///stealthnet.db'
 app.config['FERNET_KEY'] = FERNET_KEY_STR.encode() if FERNET_KEY_STR else None
 
 # Кэширование
