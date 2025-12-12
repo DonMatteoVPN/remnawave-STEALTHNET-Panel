@@ -32,6 +32,7 @@ RUN chmod +x app.py client_bot.py
 # Открываем порты
 EXPOSE 5000
 
-# Команда по умолчанию (запуск Flask API)
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+# Команда по умолчанию (запуск Flask API напрямую через app.py)
+# Это гарантирует, что init_database() вызывается корректно
+CMD ["python3", "app.py"]
 
