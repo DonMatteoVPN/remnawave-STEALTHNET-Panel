@@ -80,7 +80,7 @@ cd remnawave-STEALTHNET-Panel
 
 # Или если копируете файлы вручную:
 # mkdir -p /opt/STEALTHNET-Admin-Panel
-# cd /opt/STEALTHNET-Admin-Panel
+# cd /opt/remnawave-STEALTHNET-Panel
 # Скопируйте все файлы из папки "Готовый проект" сюда
 ```
 
@@ -102,7 +102,7 @@ mkdir -p instance cache logs nginx/ssl frontend/build
 ### Создаем файл .env
 
 ```bash
-cd /opt/STEALTHNET-Admin-Panel
+cd /opt/remnawave-STEALTHNET-Panel
 
 # Если есть .env.example, копируем его
 if [ -f .env.example ]; then
@@ -219,7 +219,7 @@ CRYSTALPAY_API_SECRET=ваш_api_secret
 # Если еще не клонировали, выполните:
 cd /opt
 sudo git clone https://github.com/GOFONCK/STEALTHNET-Admin-Panel.git
-cd STEALTHNET-Admin-Panel
+cd remnawave-STEALTHNET-Panel
 sudo chown -R $USER:$USER /opt/STEALTHNET-Admin-Panel
 
 # Структура должна быть такой:
@@ -360,7 +360,7 @@ openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 ### Подготовка к запуску
 
 ```bash
-cd /opt/STEALTHNET-Admin-Panel
+cd /opt/remnawave-STEALTHNET-Panel
 
 # Создаем директорию instance для базы данных (если еще не создана)
 mkdir -p instance
@@ -492,7 +492,7 @@ docker compose exec bot bash
 ### Обновление проекта
 
 ```bash
-cd /opt/STEALTHNET-Admin-Panel
+cd /opt/remnawave-STEALTHNET-Panel
 
 # Останавливаем контейнеры
 docker compose down
@@ -685,7 +685,7 @@ sudo nano /etc/systemd/system/stealthnet.service
 При обновлении проекта:
 
 ```bash
-cd /opt/STEALTHNET-Admin-Panel
+cd /opt/remnawave-STEALTHNET-Panel
 
 # 1. Останавливаем контейнеры
 docker compose down
@@ -797,6 +797,7 @@ docker compose logs -f
 ---
 
 **Удачной установки!** 🚀
+
 
 
 
