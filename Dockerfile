@@ -27,12 +27,12 @@ RUN mkdir -p instance cache logs
 ENV INSTANCE_PATH=/app/instance
 
 # Устанавливаем права на выполнение
-RUN chmod +x app.py client_bot.py
+RUN chmod +x app.py client_bot.py run_with_migrations.py
 
 # Открываем порты
 EXPOSE 5000
 
-# Команда по умолчанию (запуск Flask API напрямую через app.py)
-# Это гарантирует, что init_database() вызывается корректно
-CMD ["python3", "app.py"]
+# Команда по умолчанию (запуск с автоматическими миграциями)
+# Скрипт проверяет наличие БД и выполняет миграции перед запуском app.py
+CMD ["python3", "run_with_migrations.py"]
 

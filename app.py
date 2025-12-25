@@ -67,7 +67,7 @@ CORS(app, resources={r"/api/.*": {
 
 # База данных и Секреты
 app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///stealthnet.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///instance/stealthnet.db")
 app.config['FERNET_KEY'] = FERNET_KEY_STR.encode() if FERNET_KEY_STR else None
 
 # Кэширование
@@ -175,8 +175,10 @@ class Tariff(db.Model):
     price_usd = db.Column(db.Float, nullable=False)
     squad_id = db.Column(db.String(128), nullable=True)  # UUID сквада из внешнего API
     traffic_limit_bytes = db.Column(db.BigInteger, default=0)  # Лимит трафика в байтах (0 = безлимит)
+    hwid_device_limit = db.Column(db.Integer, nullable=True, default=0)  # Лимит устройств (0 или NULL = безлимит)
     tier = db.Column(db.String(20), nullable=True)  # Уровень тарифа: 'basic', 'pro', 'elite' (если NULL - определяется автоматически)
     badge = db.Column(db.String(50), nullable=True)  # Бейдж тарифа (например, 'top_sale', NULL = без бейджа)
+    bonus_days = db.Column(db.Integer, nullable=True, default=0)  # Бонусные дни (0 или NULL = без бонуса)
 
 class PromoCode(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -255,6 +257,20 @@ class SystemSetting(db.Model):
     default_language = db.Column(db.String(10), default='ru', nullable=False)
     default_currency = db.Column(db.String(10), default='uah', nullable=False)
     show_language_currency_switcher = db.Column(db.Boolean, default=True, nullable=False)  # Показывать ли переключатели языка и валюты в Dashboard
+    active_languages = db.Column(db.Text, default='["ru","ua","en","cn"]', nullable=False)  # JSON массив активных языков
+    active_currencies = db.Column(db.Text, default='["uah","rub","usd"]', nullable=False)  # JSON массив активных валют
+    # Настройки цветовой темы - светлая тема
+    theme_primary_color = db.Column(db.String(20), default='#3f69ff', nullable=False)  # Акцентный цвет (светлая)
+    theme_bg_primary = db.Column(db.String(20), default='#f8fafc', nullable=False)  # Основной фон (светлая)
+    theme_bg_secondary = db.Column(db.String(20), default='#eef2ff', nullable=False)  # Вторичный фон (светлая)
+    theme_text_primary = db.Column(db.String(20), default='#0f172a', nullable=False)  # Основной текст (светлая)
+    theme_text_secondary = db.Column(db.String(20), default='#64748b', nullable=False)  # Вторичный текст (светлая)
+    # Настройки цветовой темы - тёмная тема
+    theme_primary_color_dark = db.Column(db.String(20), default='#6c7bff', nullable=False)  # Акцентный цвет (тёмная)
+    theme_bg_primary_dark = db.Column(db.String(20), default='#050816', nullable=False)  # Основной фон (тёмная)
+    theme_bg_secondary_dark = db.Column(db.String(20), default='#0f172a', nullable=False)  # Вторичный фон (тёмная)
+    theme_text_primary_dark = db.Column(db.String(20), default='#e2e8f0', nullable=False)  # Основной текст (тёмная)
+    theme_text_secondary_dark = db.Column(db.String(20), default='#94a3b8', nullable=False)  # Вторичный текст (тёмная)
 
 class BrandingSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -269,6 +285,80 @@ class BrandingSetting(db.Model):
     dashboard_tariffs_title = db.Column(db.String(200), nullable=True)  # Заголовок страницы тарифов
     dashboard_tariffs_description = db.Column(db.String(300), nullable=True)  # Описание страницы тарифов
     dashboard_tagline = db.Column(db.String(100), nullable=True)  # Слоган в сайдбаре Dashboard (например, "Secure VPN")
+    # Быстрое скачивание
+    quick_download_enabled = db.Column(db.Boolean, default=True, nullable=False)  # Показывать блок быстрого скачивания
+    quick_download_windows_url = db.Column(db.String(500), nullable=True)  # Ссылка на Windows клиент
+    quick_download_android_url = db.Column(db.String(500), nullable=True)  # Ссылка на Android клиент
+    quick_download_macos_url = db.Column(db.String(500), nullable=True)  # Ссылка на macOS клиент
+    quick_download_ios_url = db.Column(db.String(500), nullable=True)  # Ссылка на iOS клиент
+    quick_download_profile_deeplink = db.Column(db.String(200), nullable=True, default='stealthnet://install-config?url=')  # Deeplink схема для добавления профиля
+
+class BotConfig(db.Model):
+    """Конфигурация Telegram бота — все тексты, кнопки и настройки"""
+    id = db.Column(db.Integer, primary_key=True)
+    
+    # Общие настройки
+    service_name = db.Column(db.String(100), default='StealthNET', nullable=False)  # Название сервиса
+    bot_username = db.Column(db.String(100), nullable=True)  # @username бота
+    support_url = db.Column(db.String(500), nullable=True)  # Ссылка на поддержку
+    support_bot_username = db.Column(db.String(100), nullable=True)  # @username бота поддержки
+    
+    # Настройки видимости кнопок
+    show_webapp_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Кабинет"
+    show_trial_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Активировать триал"
+    show_referral_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Рефералы"
+    show_support_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Поддержка"
+    show_servers_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Серверы"
+    show_agreement_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Соглашение"
+    show_offer_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Оферта"
+    show_topup_button = db.Column(db.Boolean, default=True, nullable=False)  # Кнопка "Пополнить баланс"
+    
+    # Настройки триала
+    trial_days = db.Column(db.Integer, default=3, nullable=False)  # Количество дней триала
+    
+    # Тексты переводов (JSON) — все тексты на всех языках
+    translations_ru = db.Column(db.Text, nullable=True)  # JSON с русскими текстами
+    translations_ua = db.Column(db.Text, nullable=True)  # JSON с украинскими текстами
+    translations_en = db.Column(db.Text, nullable=True)  # JSON с английскими текстами
+    translations_cn = db.Column(db.Text, nullable=True)  # JSON с китайскими текстами
+    
+    # Кастомные тексты (если заполнены — перезаписывают стандартные)
+    welcome_message_ru = db.Column(db.Text, nullable=True)  # Приветственное сообщение (RU)
+    welcome_message_ua = db.Column(db.Text, nullable=True)  # Приветственное сообщение (UA)
+    welcome_message_en = db.Column(db.Text, nullable=True)  # Приветственное сообщение (EN)
+    welcome_message_cn = db.Column(db.Text, nullable=True)  # Приветственное сообщение (CN)
+    
+    # Тексты документов
+    user_agreement_ru = db.Column(db.Text, nullable=True)  # Пользовательское соглашение (RU)
+    user_agreement_ua = db.Column(db.Text, nullable=True)  # Пользовательское соглашение (UA)
+    user_agreement_en = db.Column(db.Text, nullable=True)  # Пользовательское соглашение (EN)
+    user_agreement_cn = db.Column(db.Text, nullable=True)  # Пользовательское соглашение (CN)
+    
+    offer_text_ru = db.Column(db.Text, nullable=True)  # Публичная оферта (RU)
+    offer_text_ua = db.Column(db.Text, nullable=True)  # Публичная оферта (UA)
+    offer_text_en = db.Column(db.Text, nullable=True)  # Публичная оферта (EN)
+    offer_text_cn = db.Column(db.Text, nullable=True)  # Публичная оферта (CN)
+    
+    # Кастомная структура меню (JSON)
+    menu_structure = db.Column(db.Text, nullable=True)  # JSON со структурой кнопок меню
+    
+    # Проверка подписки на канал/группу при регистрации
+    require_channel_subscription = db.Column(db.Boolean, default=False, nullable=False)  # Требовать подписку
+    channel_id = db.Column(db.String(100), nullable=True)  # ID канала/группы (например: @channel или -1001234567890)
+    channel_url = db.Column(db.String(500), nullable=True)  # Ссылка на канал для кнопки "Подписаться"
+    channel_subscription_text_ru = db.Column(db.Text, nullable=True)  # Текст о необходимости подписки (RU)
+    channel_subscription_text_ua = db.Column(db.Text, nullable=True)  # Текст о необходимости подписки (UA)
+    channel_subscription_text_en = db.Column(db.Text, nullable=True)  # Текст о необходимости подписки (EN)
+    channel_subscription_text_cn = db.Column(db.Text, nullable=True)  # Текст о необходимости подписки (CN)
+    
+    # Ссылка на бота для Mini App (для незарегистрированных пользователей)
+    bot_link_for_miniapp = db.Column(db.String(500), nullable=True)  # https://t.me/BotName
+    
+    # Порядок кнопок в меню (JSON массив с ID кнопок)
+    buttons_order = db.Column(db.Text, nullable=True)  # JSON: ["status", "tariffs", "topup", "servers", "referrals", "support", "settings", "agreement", "offer", "webapp"]
+    
+    # Дата обновления
+    updated_at = db.Column(db.DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
 class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -429,29 +519,72 @@ def apply_referrer_bonus_in_background(app_context, referrer_uuid, bonus_days):
         except Exception as e: print(f"[ФОН] ОШИБКА: {e}")
 
 def send_email_in_background(app_context, recipient, subject, html_body):
+    """Отправляет email в фоновом режиме"""
+    print(f"[EMAIL] ========== НАЧАЛО ОТПРАВКИ EMAIL ==========")
+    print(f"[EMAIL] Получатель: {recipient}")
+    print(f"[EMAIL] Тема: {subject}")
+    
     with app_context:
         try:
             from flask import current_app
+            
             # Проверяем настройки email перед отправкой
-            if not current_app.config.get('MAIL_SERVER'):
-                print(f"[EMAIL] ОШИБКА: MAIL_SERVER не настроен в .env")
+            mail_server = current_app.config.get('MAIL_SERVER')
+            mail_username = current_app.config.get('MAIL_USERNAME')
+            mail_password = current_app.config.get('MAIL_PASSWORD')
+            mail_port = current_app.config.get('MAIL_PORT', 465)
+            mail_use_ssl = current_app.config.get('MAIL_USE_SSL', True)
+            mail_use_tls = current_app.config.get('MAIL_USE_TLS', False)
+            
+            print(f"[EMAIL] Проверка настроек email:")
+            print(f"   MAIL_SERVER: {mail_server if mail_server else '❌ НЕ НАСТРОЕН'}")
+            print(f"   MAIL_PORT: {mail_port}")
+            print(f"   MAIL_USE_SSL: {mail_use_ssl}")
+            print(f"   MAIL_USE_TLS: {mail_use_tls}")
+            print(f"   MAIL_USERNAME: {mail_username if mail_username else '❌ НЕ НАСТРОЕН'}")
+            print(f"   MAIL_PASSWORD: {'✓ НАСТРОЕН' if mail_password else '❌ НЕ НАСТРОЕН'}")
+            
+            if not mail_server:
+                print(f"[EMAIL] ❌ КРИТИЧЕСКАЯ ОШИБКА: MAIL_SERVER не настроен в .env")
+                print(f"[EMAIL] Пожалуйста, установите переменную MAIL_SERVER в файле .env")
                 return
-            if not current_app.config.get('MAIL_USERNAME'):
-                print(f"[EMAIL] ОШИБКА: MAIL_USERNAME не настроен в .env")
+            if not mail_username:
+                print(f"[EMAIL] ❌ КРИТИЧЕСКАЯ ОШИБКА: MAIL_USERNAME не настроен в .env")
+                print(f"[EMAIL] Пожалуйста, установите переменную MAIL_USERNAME в файле .env")
                 return
-            if not current_app.config.get('MAIL_PASSWORD'):
-                print(f"[EMAIL] ОШИБКА: MAIL_PASSWORD не настроен в .env")
+            if not mail_password:
+                print(f"[EMAIL] ❌ КРИТИЧЕСКАЯ ОШИБКА: MAIL_PASSWORD не настроен в .env")
+                print(f"[EMAIL] Пожалуйста, установите переменную MAIL_PASSWORD в файле .env")
                 return
             
-            print(f"[EMAIL] Отправка письма на {recipient} с темой: {subject}")
+            print(f"[EMAIL] ✓ Все настройки email проверены, начинаю отправку...")
+            
+            # Проверяем, что объект mail инициализирован
+            if not mail:
+                print(f"[EMAIL] ❌ КРИТИЧЕСКАЯ ОШИБКА: Объект mail не инициализирован!")
+                return
+            
+            print(f"[EMAIL] Создание сообщения для {recipient}...")
+            
             msg = Message(subject, recipients=[recipient])
             msg.html = html_body
+            
+            print(f"[EMAIL] Отправка сообщения через SMTP сервер {mail_server}:{mail_port}...")
+            print(f"[EMAIL] Используется SSL: {mail_use_ssl}, TLS: {mail_use_tls}")
+            
             mail.send(msg)
-            print(f"[EMAIL] ✓ Письмо успешно отправлено на {recipient}")
+            
+            print(f"[EMAIL] ✓✓✓ Письмо успешно отправлено на {recipient} ✓✓✓")
+            print(f"[EMAIL] ========== EMAIL ОТПРАВЛЕН УСПЕШНО ==========")
+            
         except Exception as e:
-            print(f"[EMAIL] ОШИБКА отправки на {recipient}: {e}")
+            print(f"[EMAIL] ❌❌❌ КРИТИЧЕСКАЯ ОШИБКА при отправке на {recipient} ❌❌❌")
+            print(f"[EMAIL] Тип ошибки: {type(e).__name__}")
+            print(f"[EMAIL] Сообщение об ошибке: {str(e)}")
             import traceback
+            print(f"[EMAIL] Полный traceback:")
             traceback.print_exc()
+            print(f"[EMAIL] ========== ОШИБКА ОТПРАВКИ EMAIL ==========")
 
 
 # ----------------------------------------------------
@@ -583,7 +716,11 @@ def forgot_password():
         
         if not email:
             print(f"[FORGOT PASSWORD] Email пустой, возвращаем 400")
-            return jsonify({"message": "Email is required"}), 400
+            response = jsonify({"message": "Email is required"})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+            response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+            return response, 400
         
         # Ищем пользователя по email (case-insensitive поиск)
         # Пробуем сначала точное совпадение, потом case-insensitive
@@ -664,30 +801,55 @@ def forgot_password():
         """
         
         # Проверяем настройки email перед отправкой
-        if not app.config.get('MAIL_SERVER') or not app.config.get('MAIL_USERNAME') or not app.config.get('MAIL_PASSWORD'):
-            print(f"[FORGOT PASSWORD] Предупреждение: Настройки email не полностью настроены")
-            print(f"   MAIL_SERVER: {'✓' if app.config.get('MAIL_SERVER') else '✗'}")
-            print(f"   MAIL_USERNAME: {'✓' if app.config.get('MAIL_USERNAME') else '✗'}")
-            print(f"   MAIL_PASSWORD: {'✓' if app.config.get('MAIL_PASSWORD') else '✗'}")
+        mail_server = app.config.get('MAIL_SERVER')
+        mail_username = app.config.get('MAIL_USERNAME')
+        mail_password = app.config.get('MAIL_PASSWORD')
+        
+        if not mail_server or not mail_username or not mail_password:
+            print(f"[FORGOT PASSWORD] ❌ КРИТИЧЕСКАЯ ОШИБКА: Настройки email не полностью настроены!")
+            print(f"   MAIL_SERVER: {'✓' if mail_server else '✗'} ({mail_server if mail_server else 'НЕ НАСТРОЕН'})")
+            print(f"   MAIL_USERNAME: {'✓' if mail_username else '✗'} ({mail_username if mail_username else 'НЕ НАСТРОЕН'})")
+            print(f"   MAIL_PASSWORD: {'✓' if mail_password else '✗'} ({'***' if mail_password else 'НЕ НАСТРОЕН'})")
+            print(f"[FORGOT PASSWORD] ⚠️ Email НЕ БУДЕТ ОТПРАВЛЕН из-за отсутствия настроек!")
+            # Продолжаем выполнение, но email не будет отправлен
+        else:
+            print(f"[FORGOT PASSWORD] ✓ Настройки email проверены:")
+            print(f"   MAIL_SERVER: {mail_server}")
+            print(f"   MAIL_USERNAME: {mail_username}")
+            print(f"   MAIL_PASSWORD: {'***' if mail_password else 'НЕ НАСТРОЕН'}")
         
         # Отправляем email в фоновом режиме (используем тот же подход, что и при регистрации)
         print(f"[FORGOT PASSWORD] Подготовка отправки email на {user_email}")
-        threading.Thread(
+        print(f"[FORGOT PASSWORD] Тема письма: {subject}")
+        
+        # Создаем поток для отправки email
+        email_thread = threading.Thread(
             target=send_email_in_background,
             args=(app.app_context(), user_email, subject, html_body),
             daemon=True
-        ).start()
+        )
+        email_thread.start()
+        print(f"[FORGOT PASSWORD] Фоновый поток для отправки email запущен (thread ID: {email_thread.ident})")
         
         print(f"[FORGOT PASSWORD] Запрос на восстановление пароля для {user_email}, пароль {'найден' if password_source == 'existing' else 'сгенерирован'}: {password_to_send[:3]}***")
         
-        return jsonify({"message": "If this email exists, a password reset link has been sent"}), 200
+        response = jsonify({"message": "If this email exists, a password reset link has been sent"})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        print(f"[FORGOT PASSWORD] ✓✓✓ УСПЕШНО ЗАВЕРШЕНО, возвращаем ответ ✓✓✓")
+        return response, 200
         
     except Exception as e:
-        print(f"[FORGOT PASSWORD] ОШИБКА: {e}")
+        print(f"[FORGOT PASSWORD] ❌❌❌ ОШИБКА: {e} ❌❌❌")
         import traceback
         traceback.print_exc()
         # Все равно возвращаем успех для безопасности
-        return jsonify({"message": "If this email exists, a password reset link has been sent"}), 200
+        response = jsonify({"message": "If this email exists, a password reset link has been sent"})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
 
 @app.route('/api/public/login', methods=['POST'])
 @limiter.limit("10 per minute")
@@ -4432,6 +4594,142 @@ def update_user_balance(current_admin, user_id):
         db.session.rollback()
         return jsonify({"message": f"Ошибка обновления баланса: {str(e)}"}), 500
 
+@app.route('/api/admin/users/<int:user_id>/change-password', methods=['POST'])
+@admin_required
+def admin_change_user_password(current_admin, user_id):
+    """Изменение пароля пользователя администратором"""
+    try:
+        u = db.session.get(User, user_id)
+        if not u:
+            return jsonify({"message": "Пользователь не найден"}), 404
+        
+        data = request.json
+        new_password = data.get('new_password')
+        
+        if not new_password:
+            return jsonify({"message": "Требуется новый пароль"}), 400
+        
+        if len(new_password) < 6:
+            return jsonify({"message": "Пароль должен содержать минимум 6 символов"}), 400
+        
+        # Хешируем новый пароль
+        hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        u.password_hash = hashed_password
+        
+        # Сохраняем зашифрованный пароль для бота
+        if fernet:
+            try:
+                u.encrypted_password = fernet.encrypt(new_password.encode()).decode()
+            except Exception as e:
+                print(f"[ADMIN CHANGE PASSWORD] Ошибка шифрования пароля: {e}")
+        
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Пароль успешно изменен",
+            "user_email": u.email
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"[ADMIN CHANGE PASSWORD] Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Ошибка: {str(e)}"}), 500
+
+@app.route('/api/admin/users/<int:user_id>/update', methods=['POST'])
+@admin_required
+def admin_update_user(current_admin, user_id):
+    """Обновление пользователя: выдача тарифа, триал, лимит устройств"""
+    try:
+        u = db.session.get(User, user_id)
+        if not u:
+            return jsonify({"message": "Пользователь не найден"}), 404
+        
+        data = request.json
+        
+        # Получаем текущие данные пользователя из RemnaWave
+        headers, cookies = get_remnawave_headers()
+        resp = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=headers, cookies=cookies)
+        
+        if not resp.ok:
+            return jsonify({"message": "Не удалось получить данные пользователя из RemnaWave"}), 500
+        
+        live_data = resp.json().get('response', {})
+        current_expire = parse_iso_datetime(live_data.get('expireAt')) if live_data.get('expireAt') else datetime.now(timezone.utc)
+        
+        # Формируем payload для обновления
+        patch_payload = {"uuid": u.remnawave_uuid}
+        
+        # Обработка выдачи тарифа
+        if 'tariff_id' in data and data['tariff_id']:
+            tariff = db.session.get(Tariff, data['tariff_id'])
+            if not tariff:
+                return jsonify({"message": "Тариф не найден"}), 404
+            
+            # Вычисляем новую дату окончания
+            new_exp = max(datetime.now(timezone.utc), current_expire) + timedelta(days=tariff.duration_days)
+            patch_payload["expireAt"] = new_exp.isoformat()
+            
+            # Используем сквад из тарифа, если указан, иначе дефолтный
+            squad_id = tariff.squad_id if tariff.squad_id else DEFAULT_SQUAD_ID
+            patch_payload["activeInternalSquads"] = [squad_id]
+            
+            # Добавляем лимит трафика, если указан в тарифе
+            if tariff.traffic_limit_bytes and tariff.traffic_limit_bytes > 0:
+                patch_payload["trafficLimitBytes"] = tariff.traffic_limit_bytes
+                patch_payload["trafficLimitStrategy"] = "NO_RESET"
+            
+            # Добавляем лимит устройств, если указан в тарифе
+            if tariff.hwid_device_limit and tariff.hwid_device_limit > 0:
+                patch_payload["hwidDeviceLimit"] = tariff.hwid_device_limit
+        
+        # Обработка триала
+        elif 'trial_days' in data and data['trial_days']:
+            trial_days = int(data['trial_days'])
+            if trial_days <= 0:
+                return jsonify({"message": "Количество дней триала должно быть больше 0"}), 400
+            
+            # Получаем настройки рефералов для триального сквада
+            referral_settings = ReferralSetting.query.first()
+            trial_squad_id = referral_settings.trial_squad_id if referral_settings and referral_settings.trial_squad_id else DEFAULT_SQUAD_ID
+            
+            new_exp = max(datetime.now(timezone.utc), current_expire) + timedelta(days=trial_days)
+            patch_payload["expireAt"] = new_exp.isoformat()
+            patch_payload["activeInternalSquads"] = [trial_squad_id]
+        
+        # Обработка лимита устройств
+        if 'hwid_device_limit' in data:
+            hwid_limit = data['hwid_device_limit']
+            if hwid_limit is not None:
+                hwid_limit = int(hwid_limit) if int(hwid_limit) >= 0 else None
+            patch_payload["hwidDeviceLimit"] = hwid_limit
+        
+        # Отправляем обновление в RemnaWave
+        patch_headers, patch_cookies = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=patch_headers, cookies=patch_cookies, json=patch_payload)
+        
+        if not patch_resp.ok:
+            error_text = patch_resp.text
+            print(f"[ADMIN UPDATE USER] Ошибка обновления в RemnaWave: {patch_resp.status_code} - {error_text}")
+            return jsonify({"message": f"Ошибка обновления в RemnaWave: {error_text}"}), 500
+        
+        # Очищаем кэш
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete('all_live_users_map')
+        
+        return jsonify({
+            "message": "Пользователь успешно обновлен",
+            "user_email": u.email
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"[ADMIN UPDATE USER] Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Ошибка: {str(e)}"}), 500
+
 # --- SQUADS (Сквады) ---
 @app.route('/api/admin/squads', methods=['GET'])
 @admin_required
@@ -4624,8 +4922,10 @@ def get_tariffs(current_admin):
         "price_usd": t.price_usd,
         "squad_id": t.squad_id,
         "traffic_limit_bytes": t.traffic_limit_bytes or 0,
+        "hwid_device_limit": t.hwid_device_limit if t.hwid_device_limit is not None else 0,
         "tier": t.tier,
-        "badge": t.badge
+        "badge": t.badge,
+        "bonus_days": t.bonus_days if t.bonus_days is not None else 0
     } for t in Tariff.query.all()]), 200
 
 @app.route('/api/admin/tariffs', methods=['POST'])
@@ -4649,6 +4949,20 @@ def create_tariff(current_admin):
         if badge and badge not in ['top_sale']:  # Можно расширить список допустимых бейджей
             badge = None
         
+        # Обработка лимита устройств (0 или NULL = безлимит)
+        hwid_device_limit = d.get('hwid_device_limit')
+        if hwid_device_limit is not None:
+            hwid_device_limit = int(hwid_device_limit) if int(hwid_device_limit) > 0 else None
+        else:
+            hwid_device_limit = None
+        
+        # Обработка бонусных дней (0 или NULL = без бонуса)
+        bonus_days = d.get('bonus_days')
+        if bonus_days is not None:
+            bonus_days = int(bonus_days) if int(bonus_days) > 0 else None
+        else:
+            bonus_days = None
+        
         nt = Tariff(
             name=d['name'], 
             duration_days=int(d['duration_days']), 
@@ -4657,8 +4971,10 @@ def create_tariff(current_admin):
             price_usd=float(d['price_usd']),
             squad_id=d.get('squad_id'),  # Опциональное поле
             traffic_limit_bytes=traffic_limit,
+            hwid_device_limit=hwid_device_limit,
             tier=tier,
-            badge=badge
+            badge=badge,
+            bonus_days=bonus_days
         )
         db.session.add(nt); db.session.commit()
         cache.clear()  # Очищаем весь кэш
@@ -4677,8 +4993,10 @@ def create_tariff(current_admin):
             "price_usd": nt.price_usd,
             "squad_id": nt.squad_id,
             "traffic_limit_bytes": nt.traffic_limit_bytes or 0,
+            "hwid_device_limit": nt.hwid_device_limit if nt.hwid_device_limit is not None else 0,
             "tier": nt.tier,
-            "badge": nt.badge
+            "badge": nt.badge,
+            "bonus_days": nt.bonus_days if nt.bonus_days is not None else 0
         }}), 201
     except Exception as e: return jsonify({"message": str(e)}), 500
 
@@ -4699,6 +5017,12 @@ def update_tariff(current_admin, id):
         if 'traffic_limit_bytes' in d:
             traffic_limit = d.get('traffic_limit_bytes', 0)
             t.traffic_limit_bytes = int(traffic_limit) if traffic_limit else 0
+        if 'hwid_device_limit' in d:
+            hwid_device_limit = d.get('hwid_device_limit')
+            if hwid_device_limit is not None:
+                t.hwid_device_limit = int(hwid_device_limit) if int(hwid_device_limit) > 0 else None
+            else:
+                t.hwid_device_limit = None
         if 'tier' in d:
             tier = d.get('tier', '').lower() if d.get('tier') else None
             if tier and tier not in ['basic', 'pro', 'elite']:
@@ -4709,6 +5033,12 @@ def update_tariff(current_admin, id):
             if badge and badge not in ['top_sale']:  # Можно расширить список допустимых бейджей
                 badge = None
             t.badge = badge
+        if 'bonus_days' in d:
+            bonus_days = d.get('bonus_days')
+            if bonus_days is not None:
+                t.bonus_days = int(bonus_days) if int(bonus_days) > 0 else None
+            else:
+                t.bonus_days = None
         
         db.session.commit()
         cache.clear()  # Очищаем весь кэш
@@ -4729,8 +5059,10 @@ def update_tariff(current_admin, id):
                 "price_usd": t.price_usd,
                 "squad_id": t.squad_id,
                 "traffic_limit_bytes": t.traffic_limit_bytes or 0,
+                "hwid_device_limit": t.hwid_device_limit if t.hwid_device_limit is not None else 0,
                 "tier": t.tier,
-                "badge": t.badge
+                "badge": t.badge,
+                "bonus_days": t.bonus_days if t.bonus_days is not None else 0
             }
         }), 200
     except Exception as e: return jsonify({"message": str(e)}), 500
@@ -4996,7 +5328,8 @@ def get_public_tariffs():
         "squad_id": t.squad_id,
         "traffic_limit_bytes": t.traffic_limit_bytes or 0,
         "tier": t.tier,
-        "badge": t.badge
+        "badge": t.badge,
+        "bonus_days": t.bonus_days if t.bonus_days is not None else 0
     } for t in Tariff.query.all()]), 200
 
 @app.route('/api/public/nodes', methods=['GET'])
@@ -5063,28 +5396,119 @@ def set_settings():
     cache.delete(f'live_data_{user.remnawave_uuid}')
     return jsonify({"message": "OK"}), 200
 
+@app.route('/api/client/change-password', methods=['POST'])
+def change_password():
+    """Изменение пароля текущего пользователя"""
+    user = get_user_from_token()
+    if not user: return jsonify({"message": "Auth Error"}), 401
+    
+    try:
+        data = request.json
+        current_password = data.get('current_password')
+        new_password = data.get('new_password')
+        
+        if not current_password or not new_password:
+            return jsonify({"message": "Требуется текущий и новый пароль"}), 400
+        
+        if len(new_password) < 6:
+            return jsonify({"message": "Новый пароль должен содержать минимум 6 символов"}), 400
+        
+        # Проверяем текущий пароль
+        if not user.password_hash:
+            return jsonify({"message": "У вас нет пароля. Используйте восстановление пароля."}), 400
+        
+        if not bcrypt.check_password_hash(user.password_hash, current_password):
+            return jsonify({"message": "Неверный текущий пароль"}), 400
+        
+        # Хешируем новый пароль
+        hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        user.password_hash = hashed_password
+        
+        # Сохраняем зашифрованный пароль для бота
+        if fernet:
+            try:
+                user.encrypted_password = fernet.encrypt(new_password.encode()).decode()
+            except Exception as e:
+                print(f"[CHANGE PASSWORD] Ошибка шифрования пароля: {e}")
+        
+        db.session.commit()
+        
+        return jsonify({"message": "Пароль успешно изменен"}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"[CHANGE PASSWORD] Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Ошибка: {str(e)}"}), 500
+
 # --- SYSTEM SETTINGS (Default Language & Currency) ---
 @app.route('/api/admin/system-settings', methods=['GET', 'POST'])
 @admin_required
 def system_settings(current_admin):
+    import json
     s = SystemSetting.query.first() or SystemSetting(id=1)
     if not s.id: 
         db.session.add(s)
         db.session.commit()
-        # Устанавливаем значение по умолчанию для нового поля
+        # Устанавливаем значения по умолчанию
         if s.show_language_currency_switcher is None:
             s.show_language_currency_switcher = True
-            db.session.commit()
+        if not s.active_languages or s.active_languages.strip() == '':
+            s.active_languages = '["ru","ua","en","cn"]'
+        if not s.active_currencies or s.active_currencies.strip() == '':
+            s.active_currencies = '["uah","rub","usd"]'
+        db.session.commit()
     
     if request.method == 'GET':
+        # Парсим JSON массивы
+        try:
+            active_languages = json.loads(s.active_languages) if s.active_languages else ["ru", "ua", "en", "cn"]
+        except:
+            active_languages = ["ru", "ua", "en", "cn"]
+        
+        try:
+            active_currencies = json.loads(s.active_currencies) if s.active_currencies else ["uah", "rub", "usd"]
+        except:
+            active_currencies = ["uah", "rub", "usd"]
+        
+        # Автозаполнение NULL значений в БД
+        needs_save = False
+        if not s.active_languages:
+            s.active_languages = '["ru","ua","en","cn"]'
+            needs_save = True
+        if not s.active_currencies:
+            s.active_currencies = '["uah","rub","usd"]'
+            needs_save = True
+        if needs_save:
+            try:
+                db.session.commit()
+            except:
+                db.session.rollback()
+        
         return jsonify({
             "default_language": s.default_language,
             "default_currency": s.default_currency,
-            "show_language_currency_switcher": s.show_language_currency_switcher if s.show_language_currency_switcher is not None else True
+            "show_language_currency_switcher": s.show_language_currency_switcher if s.show_language_currency_switcher is not None else True,
+            "active_languages": active_languages,
+            "active_currencies": active_currencies,
+            # Цвета светлой темы
+            "theme_primary_color": getattr(s, 'theme_primary_color', '#3f69ff') or '#3f69ff',
+            "theme_bg_primary": getattr(s, 'theme_bg_primary', '#f8fafc') or '#f8fafc',
+            "theme_bg_secondary": getattr(s, 'theme_bg_secondary', '#eef2ff') or '#eef2ff',
+            "theme_text_primary": getattr(s, 'theme_text_primary', '#0f172a') or '#0f172a',
+            "theme_text_secondary": getattr(s, 'theme_text_secondary', '#64748b') or '#64748b',
+            # Цвета тёмной темы
+            "theme_primary_color_dark": getattr(s, 'theme_primary_color_dark', '#6c7bff') or '#6c7bff',
+            "theme_bg_primary_dark": getattr(s, 'theme_bg_primary_dark', '#050816') or '#050816',
+            "theme_bg_secondary_dark": getattr(s, 'theme_bg_secondary_dark', '#0f172a') or '#0f172a',
+            "theme_text_primary_dark": getattr(s, 'theme_text_primary_dark', '#e2e8f0') or '#e2e8f0',
+            "theme_text_secondary_dark": getattr(s, 'theme_text_secondary_dark', '#94a3b8') or '#94a3b8'
         }), 200
     
     # POST - обновление
     try:
+        import json
         data = request.json
         if 'default_language' in data:
             if data['default_language'] not in ['ru', 'ua', 'cn', 'en']:
@@ -5096,7 +5520,54 @@ def system_settings(current_admin):
             s.default_currency = data['default_currency']
         if 'show_language_currency_switcher' in data:
             s.show_language_currency_switcher = bool(data['show_language_currency_switcher'])
+        if 'active_languages' in data:
+            # Валидация: должен быть массив строк
+            if isinstance(data['active_languages'], list):
+                valid_langs = ['ru', 'ua', 'en', 'cn']
+                filtered_langs = [lang for lang in data['active_languages'] if lang in valid_langs]
+                if len(filtered_langs) == 0:
+                    return jsonify({"message": "At least one language must be active"}), 400
+                s.active_languages = json.dumps(filtered_langs)
+            else:
+                return jsonify({"message": "active_languages must be an array"}), 400
+        if 'active_currencies' in data:
+            # Валидация: должен быть массив строк
+            if isinstance(data['active_currencies'], list):
+                valid_currs = ['uah', 'rub', 'usd']
+                filtered_currs = [curr for curr in data['active_currencies'] if curr in valid_currs]
+                if len(filtered_currs) == 0:
+                    return jsonify({"message": "At least one currency must be active"}), 400
+                s.active_currencies = json.dumps(filtered_currs)
+            else:
+                return jsonify({"message": "active_currencies must be an array"}), 400
+        # Обработка цветов темы - хелпер для валидации
+        def is_valid_hex(color):
+            return color and color.startswith('#') and len(color) in [4, 7]
+        
+        # Светлая тема
+        if 'theme_primary_color' in data and is_valid_hex(data['theme_primary_color']):
+            s.theme_primary_color = data['theme_primary_color']
+        if 'theme_bg_primary' in data and is_valid_hex(data['theme_bg_primary']):
+            s.theme_bg_primary = data['theme_bg_primary']
+        if 'theme_bg_secondary' in data and is_valid_hex(data['theme_bg_secondary']):
+            s.theme_bg_secondary = data['theme_bg_secondary']
+        if 'theme_text_primary' in data and is_valid_hex(data['theme_text_primary']):
+            s.theme_text_primary = data['theme_text_primary']
+        if 'theme_text_secondary' in data and is_valid_hex(data['theme_text_secondary']):
+            s.theme_text_secondary = data['theme_text_secondary']
+        # Тёмная тема
+        if 'theme_primary_color_dark' in data and is_valid_hex(data['theme_primary_color_dark']):
+            s.theme_primary_color_dark = data['theme_primary_color_dark']
+        if 'theme_bg_primary_dark' in data and is_valid_hex(data['theme_bg_primary_dark']):
+            s.theme_bg_primary_dark = data['theme_bg_primary_dark']
+        if 'theme_bg_secondary_dark' in data and is_valid_hex(data['theme_bg_secondary_dark']):
+            s.theme_bg_secondary_dark = data['theme_bg_secondary_dark']
+        if 'theme_text_primary_dark' in data and is_valid_hex(data['theme_text_primary_dark']):
+            s.theme_text_primary_dark = data['theme_text_primary_dark']
+        if 'theme_text_secondary_dark' in data and is_valid_hex(data['theme_text_secondary_dark']):
+            s.theme_text_secondary_dark = data['theme_text_secondary_dark']
         db.session.commit()
+        cache.clear()  # Очищаем весь кэш
         return jsonify({"message": "Updated"}), 200
     except Exception as e:
         return jsonify({"message": str(e)}), 500
@@ -5216,7 +5687,14 @@ def branding_settings(current_admin):
             "dashboard_servers_description": b.dashboard_servers_description or "",
             "dashboard_tariffs_title": b.dashboard_tariffs_title or "",
             "dashboard_tariffs_description": b.dashboard_tariffs_description or "",
-            "dashboard_tagline": b.dashboard_tagline or ""
+            "dashboard_tagline": b.dashboard_tagline or "",
+            # Быстрое скачивание
+            "quick_download_enabled": b.quick_download_enabled if hasattr(b, 'quick_download_enabled') and b.quick_download_enabled is not None else True,
+            "quick_download_windows_url": getattr(b, 'quick_download_windows_url', '') or "",
+            "quick_download_android_url": getattr(b, 'quick_download_android_url', '') or "",
+            "quick_download_macos_url": getattr(b, 'quick_download_macos_url', '') or "",
+            "quick_download_ios_url": getattr(b, 'quick_download_ios_url', '') or "",
+            "quick_download_profile_deeplink": getattr(b, 'quick_download_profile_deeplink', '') or "stealthnet://install-config?url="
         }), 200
     
     # POST - обновление
@@ -5244,6 +5722,19 @@ def branding_settings(current_admin):
             b.dashboard_tariffs_description = data['dashboard_tariffs_description'] or None
         if 'dashboard_tagline' in data:
             b.dashboard_tagline = data['dashboard_tagline'] or None
+        # Быстрое скачивание
+        if 'quick_download_enabled' in data:
+            b.quick_download_enabled = bool(data['quick_download_enabled'])
+        if 'quick_download_windows_url' in data:
+            b.quick_download_windows_url = data['quick_download_windows_url'] or None
+        if 'quick_download_android_url' in data:
+            b.quick_download_android_url = data['quick_download_android_url'] or None
+        if 'quick_download_macos_url' in data:
+            b.quick_download_macos_url = data['quick_download_macos_url'] or None
+        if 'quick_download_ios_url' in data:
+            b.quick_download_ios_url = data['quick_download_ios_url'] or None
+        if 'quick_download_profile_deeplink' in data:
+            b.quick_download_profile_deeplink = data['quick_download_profile_deeplink'] or 'stealthnet://install-config?url='
         db.session.commit()
         return jsonify({"message": "Branding settings updated"}), 200
     except Exception as e:
@@ -5268,22 +5759,578 @@ def public_branding():
         "dashboard_servers_description": b.dashboard_servers_description or "",
         "dashboard_tariffs_title": b.dashboard_tariffs_title or "",
         "dashboard_tariffs_description": b.dashboard_tariffs_description or "",
-        "dashboard_tagline": b.dashboard_tagline or ""
+        "dashboard_tagline": b.dashboard_tagline or "",
+        # Быстрое скачивание
+        "quick_download_enabled": b.quick_download_enabled if hasattr(b, 'quick_download_enabled') and b.quick_download_enabled is not None else True,
+        "quick_download_windows_url": getattr(b, 'quick_download_windows_url', '') or "",
+        "quick_download_android_url": getattr(b, 'quick_download_android_url', '') or "",
+        "quick_download_macos_url": getattr(b, 'quick_download_macos_url', '') or "",
+        "quick_download_ios_url": getattr(b, 'quick_download_ios_url', '') or "",
+        "quick_download_profile_deeplink": getattr(b, 'quick_download_profile_deeplink', '') or "stealthnet://install-config?url="
     }), 200
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# КОНСТРУКТОР БОТА
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/admin/bot-config', methods=['GET', 'POST'])
+@admin_required
+def admin_bot_config(current_admin):
+    """Управление конфигурацией Telegram бота"""
+    import json
+    
+    # Получаем или создаём конфиг
+    config = BotConfig.query.first()
+    if not config:
+        config = BotConfig(id=1)
+        db.session.add(config)
+        db.session.commit()
+    
+    if request.method == 'GET':
+        # Получаем все настройки
+        return jsonify({
+            # Общие настройки
+            "service_name": config.service_name or "StealthNET",
+            "bot_username": config.bot_username or "",
+            "support_url": config.support_url or "",
+            "support_bot_username": config.support_bot_username or "",
+            
+            # Настройки видимости кнопок
+            "show_webapp_button": config.show_webapp_button if config.show_webapp_button is not None else True,
+            "show_trial_button": config.show_trial_button if config.show_trial_button is not None else True,
+            "show_referral_button": config.show_referral_button if config.show_referral_button is not None else True,
+            "show_support_button": config.show_support_button if config.show_support_button is not None else True,
+            "show_servers_button": config.show_servers_button if config.show_servers_button is not None else True,
+            "show_agreement_button": config.show_agreement_button if config.show_agreement_button is not None else True,
+            "show_offer_button": config.show_offer_button if config.show_offer_button is not None else True,
+            "show_topup_button": config.show_topup_button if config.show_topup_button is not None else True,
+            
+            # Настройки триала
+            "trial_days": config.trial_days or 3,
+            
+            # Переводы (JSON -> dict)
+            "translations_ru": json.loads(config.translations_ru) if config.translations_ru else {},
+            "translations_ua": json.loads(config.translations_ua) if config.translations_ua else {},
+            "translations_en": json.loads(config.translations_en) if config.translations_en else {},
+            "translations_cn": json.loads(config.translations_cn) if config.translations_cn else {},
+            
+            # Кастомные сообщения
+            "welcome_message_ru": config.welcome_message_ru or "",
+            "welcome_message_ua": config.welcome_message_ua or "",
+            "welcome_message_en": config.welcome_message_en or "",
+            "welcome_message_cn": config.welcome_message_cn or "",
+            
+            # Документы
+            "user_agreement_ru": config.user_agreement_ru or "",
+            "user_agreement_ua": config.user_agreement_ua or "",
+            "user_agreement_en": config.user_agreement_en or "",
+            "user_agreement_cn": config.user_agreement_cn or "",
+            
+            "offer_text_ru": config.offer_text_ru or "",
+            "offer_text_ua": config.offer_text_ua or "",
+            "offer_text_en": config.offer_text_en or "",
+            "offer_text_cn": config.offer_text_cn or "",
+            
+            # Структура меню
+            "menu_structure": json.loads(config.menu_structure) if config.menu_structure else None,
+            
+            # Проверка подписки на канал
+            "require_channel_subscription": config.require_channel_subscription if hasattr(config, 'require_channel_subscription') and config.require_channel_subscription is not None else False,
+            "channel_id": getattr(config, 'channel_id', '') or "",
+            "channel_url": getattr(config, 'channel_url', '') or "",
+            "channel_subscription_text_ru": getattr(config, 'channel_subscription_text_ru', '') or "",
+            "channel_subscription_text_ua": getattr(config, 'channel_subscription_text_ua', '') or "",
+            "channel_subscription_text_en": getattr(config, 'channel_subscription_text_en', '') or "",
+            "channel_subscription_text_cn": getattr(config, 'channel_subscription_text_cn', '') or "",
+            
+            # Ссылка на бота для Mini App
+            "bot_link_for_miniapp": getattr(config, 'bot_link_for_miniapp', '') or "",
+            
+            # Порядок кнопок
+            "buttons_order": json.loads(config.buttons_order) if hasattr(config, 'buttons_order') and config.buttons_order else ["connect", "trial", "status", "tariffs", "topup", "servers", "referrals", "support", "settings", "agreement", "offer", "webapp"],
+            
+            "updated_at": config.updated_at.isoformat() if config.updated_at else None
+        }), 200
+    
+    # POST - обновление
+    try:
+        data = request.json
+        
+        # Общие настройки
+        if 'service_name' in data:
+            config.service_name = data['service_name'] or "StealthNET"
+        if 'bot_username' in data:
+            config.bot_username = data['bot_username'] or None
+        if 'support_url' in data:
+            config.support_url = data['support_url'] or None
+        if 'support_bot_username' in data:
+            config.support_bot_username = data['support_bot_username'] or None
+        
+        # Настройки видимости кнопок
+        if 'show_webapp_button' in data:
+            config.show_webapp_button = bool(data['show_webapp_button'])
+        if 'show_trial_button' in data:
+            config.show_trial_button = bool(data['show_trial_button'])
+        if 'show_referral_button' in data:
+            config.show_referral_button = bool(data['show_referral_button'])
+        if 'show_support_button' in data:
+            config.show_support_button = bool(data['show_support_button'])
+        if 'show_servers_button' in data:
+            config.show_servers_button = bool(data['show_servers_button'])
+        if 'show_agreement_button' in data:
+            config.show_agreement_button = bool(data['show_agreement_button'])
+        if 'show_offer_button' in data:
+            config.show_offer_button = bool(data['show_offer_button'])
+        if 'show_topup_button' in data:
+            config.show_topup_button = bool(data['show_topup_button'])
+        
+        # Настройки триала
+        if 'trial_days' in data:
+            config.trial_days = int(data['trial_days']) if data['trial_days'] else 3
+        
+        # Переводы (dict -> JSON)
+        if 'translations_ru' in data:
+            config.translations_ru = json.dumps(data['translations_ru'], ensure_ascii=False) if data['translations_ru'] else None
+        if 'translations_ua' in data:
+            config.translations_ua = json.dumps(data['translations_ua'], ensure_ascii=False) if data['translations_ua'] else None
+        if 'translations_en' in data:
+            config.translations_en = json.dumps(data['translations_en'], ensure_ascii=False) if data['translations_en'] else None
+        if 'translations_cn' in data:
+            config.translations_cn = json.dumps(data['translations_cn'], ensure_ascii=False) if data['translations_cn'] else None
+        
+        # Кастомные сообщения
+        if 'welcome_message_ru' in data:
+            config.welcome_message_ru = data['welcome_message_ru'] or None
+        if 'welcome_message_ua' in data:
+            config.welcome_message_ua = data['welcome_message_ua'] or None
+        if 'welcome_message_en' in data:
+            config.welcome_message_en = data['welcome_message_en'] or None
+        if 'welcome_message_cn' in data:
+            config.welcome_message_cn = data['welcome_message_cn'] or None
+        
+        # Документы
+        if 'user_agreement_ru' in data:
+            config.user_agreement_ru = data['user_agreement_ru'] or None
+        if 'user_agreement_ua' in data:
+            config.user_agreement_ua = data['user_agreement_ua'] or None
+        if 'user_agreement_en' in data:
+            config.user_agreement_en = data['user_agreement_en'] or None
+        if 'user_agreement_cn' in data:
+            config.user_agreement_cn = data['user_agreement_cn'] or None
+        
+        if 'offer_text_ru' in data:
+            config.offer_text_ru = data['offer_text_ru'] or None
+        if 'offer_text_ua' in data:
+            config.offer_text_ua = data['offer_text_ua'] or None
+        if 'offer_text_en' in data:
+            config.offer_text_en = data['offer_text_en'] or None
+        if 'offer_text_cn' in data:
+            config.offer_text_cn = data['offer_text_cn'] or None
+        
+        # Структура меню
+        if 'menu_structure' in data:
+            config.menu_structure = json.dumps(data['menu_structure'], ensure_ascii=False) if data['menu_structure'] else None
+        
+        # Проверка подписки на канал
+        if 'require_channel_subscription' in data:
+            config.require_channel_subscription = bool(data['require_channel_subscription'])
+        if 'channel_id' in data:
+            config.channel_id = data['channel_id'] or None
+        if 'channel_url' in data:
+            config.channel_url = data['channel_url'] or None
+        if 'channel_subscription_text_ru' in data:
+            config.channel_subscription_text_ru = data['channel_subscription_text_ru'] or None
+        if 'channel_subscription_text_ua' in data:
+            config.channel_subscription_text_ua = data['channel_subscription_text_ua'] or None
+        if 'channel_subscription_text_en' in data:
+            config.channel_subscription_text_en = data['channel_subscription_text_en'] or None
+        if 'channel_subscription_text_cn' in data:
+            config.channel_subscription_text_cn = data['channel_subscription_text_cn'] or None
+        
+        # Ссылка на бота для Mini App
+        if 'bot_link_for_miniapp' in data:
+            config.bot_link_for_miniapp = data['bot_link_for_miniapp'] or None
+        
+        # Порядок кнопок
+        if 'buttons_order' in data:
+            config.buttons_order = json.dumps(data['buttons_order'], ensure_ascii=False) if data['buttons_order'] else None
+        
+        db.session.commit()
+        return jsonify({"message": "Bot config updated successfully"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": str(e)}), 500
+
+
+@app.route('/api/public/bot-config', methods=['GET'])
+def public_bot_config():
+    """Публичный эндпоинт для получения конфигурации бота (для самого бота)"""
+    import json
+    
+    config = BotConfig.query.first()
+    if not config:
+        # Возвращаем дефолтные значения
+        return jsonify({
+            "service_name": "StealthNET",
+            "show_webapp_button": True,
+            "show_trial_button": True,
+            "show_referral_button": True,
+            "show_support_button": True,
+            "show_servers_button": True,
+            "show_agreement_button": True,
+            "show_offer_button": True,
+            "show_topup_button": True,
+            "trial_days": 3,
+            "translations": {},
+            "welcome_messages": {},
+            "user_agreements": {},
+            "offer_texts": {},
+            "menu_structure": None,
+            "require_channel_subscription": False,
+            "channel_id": "",
+            "channel_url": "",
+            "channel_subscription_texts": {"ru": "", "ua": "", "en": "", "cn": ""},
+            "bot_link_for_miniapp": "",
+            "buttons_order": ["connect", "trial", "status", "tariffs", "topup", "servers", "referrals", "support", "settings", "agreement", "offer", "webapp"]
+        }), 200
+    
+    return jsonify({
+        "service_name": config.service_name or "StealthNET",
+        "bot_username": config.bot_username or "",
+        "support_url": config.support_url or "",
+        "support_bot_username": config.support_bot_username or "",
+        
+        "show_webapp_button": config.show_webapp_button if config.show_webapp_button is not None else True,
+        "show_trial_button": config.show_trial_button if config.show_trial_button is not None else True,
+        "show_referral_button": config.show_referral_button if config.show_referral_button is not None else True,
+        "show_support_button": config.show_support_button if config.show_support_button is not None else True,
+        "show_servers_button": config.show_servers_button if config.show_servers_button is not None else True,
+        "show_agreement_button": config.show_agreement_button if config.show_agreement_button is not None else True,
+        "show_offer_button": config.show_offer_button if config.show_offer_button is not None else True,
+        "show_topup_button": config.show_topup_button if config.show_topup_button is not None else True,
+        "trial_days": config.trial_days or 3,
+        
+        # Все переводы в одном объекте
+        "translations": {
+            "ru": json.loads(config.translations_ru) if config.translations_ru else {},
+            "ua": json.loads(config.translations_ua) if config.translations_ua else {},
+            "en": json.loads(config.translations_en) if config.translations_en else {},
+            "cn": json.loads(config.translations_cn) if config.translations_cn else {}
+        },
+        
+        # Приветственные сообщения
+        "welcome_messages": {
+            "ru": config.welcome_message_ru or "",
+            "ua": config.welcome_message_ua or "",
+            "en": config.welcome_message_en or "",
+            "cn": config.welcome_message_cn or ""
+        },
+        
+        # Документы
+        "user_agreements": {
+            "ru": config.user_agreement_ru or "",
+            "ua": config.user_agreement_ua or "",
+            "en": config.user_agreement_en or "",
+            "cn": config.user_agreement_cn or ""
+        },
+        "offer_texts": {
+            "ru": config.offer_text_ru or "",
+            "ua": config.offer_text_ua or "",
+            "en": config.offer_text_en or "",
+            "cn": config.offer_text_cn or ""
+        },
+        
+        "menu_structure": json.loads(config.menu_structure) if config.menu_structure else None,
+        
+        # Проверка подписки на канал
+        "require_channel_subscription": getattr(config, 'require_channel_subscription', False) or False,
+        "channel_id": getattr(config, 'channel_id', '') or "",
+        "channel_url": getattr(config, 'channel_url', '') or "",
+        "channel_subscription_texts": {
+            "ru": getattr(config, 'channel_subscription_text_ru', '') or "",
+            "ua": getattr(config, 'channel_subscription_text_ua', '') or "",
+            "en": getattr(config, 'channel_subscription_text_en', '') or "",
+            "cn": getattr(config, 'channel_subscription_text_cn', '') or ""
+        },
+        
+        # Ссылка на бота для Mini App
+        "bot_link_for_miniapp": getattr(config, 'bot_link_for_miniapp', '') or "",
+        
+        # Порядок кнопок
+        "buttons_order": json.loads(config.buttons_order) if hasattr(config, 'buttons_order') and config.buttons_order else ["connect", "trial", "status", "tariffs", "topup", "servers", "referrals", "support", "settings", "agreement", "offer", "webapp"]
+    }), 200
+
+
+@app.route('/api/admin/bot-config/default-translations', methods=['GET'])
+@admin_required
+def get_default_translations(current_admin):
+    """Получить дефолтные переводы бота для редактирования"""
+    # Эти переводы можно загрузить из client_bot.py или определить здесь
+    default_translations = {
+        "ru": {
+            "main_menu": "Главное меню",
+            "welcome_bot": "Добро пожаловать в {SERVICE_NAME} VPN Bot!",
+            "welcome_user": "Добро пожаловать",
+            "stealthnet_bot": "{SERVICE_NAME} VPN Bot",
+            "not_registered_text": "Вы еще не зарегистрированы в системе.",
+            "register_here": "Вы можете зарегистрироваться прямо здесь в боте или на сайте.",
+            "after_register": "После регистрации вы получите логин и пароль для входа на сайте.",
+            "subscription_status_title": "Статус подписки",
+            "active": "Активна",
+            "inactive": "Не активна",
+            "balance": "Баланс",
+            "traffic_title": "Трафик",
+            "unlimited_traffic": "Безлимитный",
+            "days": "дней",
+            "connect_button": "Подключиться",
+            "activate_trial_button": "Активировать триал",
+            "status_button": "Статус подписки",
+            "tariffs_button": "Тарифы",
+            "servers_button": "Серверы",
+            "referrals_button": "Рефералы",
+            "support_button": "Поддержка",
+            "settings_button": "Настройки",
+            "top_up_balance": "Пополнить баланс",
+            "cabinet_button": "Кабинет",
+            "user_agreement_button": "Соглашение",
+            "offer_button": "Оферта",
+            "main_menu_button": "Главное меню",
+            "back": "Назад",
+            "register": "Зарегистрироваться",
+            "on_site": "на сайте",
+            "error": "Ошибка",
+            "auth_error": "Ошибка авторизации",
+            "failed_to_load": "Не удалось загрузить данные",
+            "trial_activated_title": "Триал активирован!",
+            "trial_days_received": "Вы получили {DAYS} дней премиум доступа.",
+            "enjoy_vpn": "Наслаждайтесь VPN без ограничений!",
+            "referral_program": "Реферальная программа",
+            "invite_friends": "Приглашайте друзей и получайте бонусы!",
+            "your_referral_link": "Ваша реферальная ссылка",
+            "your_code": "Ваш код",
+            "copy_link": "Копировать ссылку",
+            "support_title": "Поддержка",
+            "create_ticket_button": "Создать тикет",
+            "currency": "Валюта",
+            "language": "Язык",
+            "select_currency": "Выберите валюту:",
+            "select_language": "Выберите язык:",
+            "settings_saved": "Настройки сохранены"
+        },
+        "ua": {
+            "main_menu": "Головне меню",
+            "welcome_bot": "Ласкаво просимо в {SERVICE_NAME} VPN Bot!",
+            "welcome_user": "Ласкаво просимо",
+            "stealthnet_bot": "{SERVICE_NAME} VPN Bot",
+            "not_registered_text": "Ви ще не зареєстровані в системі.",
+            "register_here": "Ви можете зареєструватися прямо тут в боті або на сайті.",
+            "after_register": "Після реєстрації ви отримаєте логін і пароль для входу на сайті.",
+            "subscription_status_title": "Статус підписки",
+            "active": "Активна",
+            "inactive": "Не активна",
+            "balance": "Баланс",
+            "traffic_title": "Трафік",
+            "unlimited_traffic": "Безлімітний",
+            "days": "днів",
+            "connect_button": "Підключитися",
+            "activate_trial_button": "Активувати триал",
+            "status_button": "Статус підписки",
+            "tariffs_button": "Тарифи",
+            "servers_button": "Сервери",
+            "referrals_button": "Реферали",
+            "support_button": "Підтримка",
+            "settings_button": "Налаштування",
+            "top_up_balance": "Поповнити баланс",
+            "cabinet_button": "Кабінет",
+            "user_agreement_button": "Угода",
+            "offer_button": "Оферта",
+            "main_menu_button": "Головне меню",
+            "back": "Назад",
+            "register": "Зареєструватися",
+            "on_site": "на сайті",
+            "error": "Помилка",
+            "auth_error": "Помилка авторизації",
+            "failed_to_load": "Не вдалося завантажити дані",
+            "trial_activated_title": "Триал активовано!",
+            "trial_days_received": "Ви отримали {DAYS} днів преміум доступу.",
+            "enjoy_vpn": "Насолоджуйтесь VPN без обмежень!",
+            "referral_program": "Реферальна програма",
+            "invite_friends": "Запрошуйте друзів і отримуйте бонуси!",
+            "your_referral_link": "Ваше реферальне посилання",
+            "your_code": "Ваш код",
+            "copy_link": "Копіювати посилання",
+            "support_title": "Підтримка",
+            "create_ticket_button": "Створити тікет",
+            "currency": "Валюта",
+            "language": "Мова",
+            "select_currency": "Виберіть валюту:",
+            "select_language": "Виберіть мову:",
+            "settings_saved": "Налаштування збережено"
+        },
+        "en": {
+            "main_menu": "Main Menu",
+            "welcome_bot": "Welcome to {SERVICE_NAME} VPN Bot!",
+            "welcome_user": "Welcome",
+            "stealthnet_bot": "{SERVICE_NAME} VPN Bot",
+            "not_registered_text": "You are not registered yet.",
+            "register_here": "You can register right here in the bot or on the website.",
+            "after_register": "After registration, you will receive login credentials for the website.",
+            "subscription_status_title": "Subscription Status",
+            "active": "Active",
+            "inactive": "Inactive",
+            "balance": "Balance",
+            "traffic_title": "Traffic",
+            "unlimited_traffic": "Unlimited",
+            "days": "days",
+            "connect_button": "Connect",
+            "activate_trial_button": "Activate Trial",
+            "status_button": "Subscription Status",
+            "tariffs_button": "Tariffs",
+            "servers_button": "Servers",
+            "referrals_button": "Referrals",
+            "support_button": "Support",
+            "settings_button": "Settings",
+            "top_up_balance": "Top Up Balance",
+            "cabinet_button": "Dashboard",
+            "user_agreement_button": "Agreement",
+            "offer_button": "Terms",
+            "main_menu_button": "Main Menu",
+            "back": "Back",
+            "register": "Register",
+            "on_site": "on site",
+            "error": "Error",
+            "auth_error": "Authorization error",
+            "failed_to_load": "Failed to load data",
+            "trial_activated_title": "Trial Activated!",
+            "trial_days_received": "You received {DAYS} days of premium access.",
+            "enjoy_vpn": "Enjoy VPN without limits!",
+            "referral_program": "Referral Program",
+            "invite_friends": "Invite friends and get bonuses!",
+            "your_referral_link": "Your referral link",
+            "your_code": "Your code",
+            "copy_link": "Copy link",
+            "support_title": "Support",
+            "create_ticket_button": "Create ticket",
+            "currency": "Currency",
+            "language": "Language",
+            "select_currency": "Select currency:",
+            "select_language": "Select language:",
+            "settings_saved": "Settings saved"
+        },
+        "cn": {
+            "main_menu": "主菜单",
+            "welcome_bot": "欢迎使用 {SERVICE_NAME} VPN Bot!",
+            "welcome_user": "欢迎",
+            "stealthnet_bot": "{SERVICE_NAME} VPN Bot",
+            "not_registered_text": "您尚未注册。",
+            "register_here": "您可以在此机器人中或在网站上注册。",
+            "after_register": "注册后，您将获得网站登录凭据。",
+            "subscription_status_title": "订阅状态",
+            "active": "活跃",
+            "inactive": "不活跃",
+            "balance": "余额",
+            "traffic_title": "流量",
+            "unlimited_traffic": "无限",
+            "days": "天",
+            "connect_button": "连接",
+            "activate_trial_button": "激活试用",
+            "status_button": "订阅状态",
+            "tariffs_button": "套餐",
+            "servers_button": "服务器",
+            "referrals_button": "推荐",
+            "support_button": "支持",
+            "settings_button": "设置",
+            "top_up_balance": "充值余额",
+            "cabinet_button": "仪表板",
+            "user_agreement_button": "协议",
+            "offer_button": "条款",
+            "main_menu_button": "主菜单",
+            "back": "返回",
+            "register": "注册",
+            "on_site": "在网站上",
+            "error": "错误",
+            "auth_error": "授权错误",
+            "failed_to_load": "加载数据失败",
+            "trial_activated_title": "试用已激活！",
+            "trial_days_received": "您获得了 {DAYS} 天的高级访问权限。",
+            "enjoy_vpn": "享受无限制的VPN！",
+            "referral_program": "推荐计划",
+            "invite_friends": "邀请朋友并获得奖励！",
+            "your_referral_link": "您的推荐链接",
+            "your_code": "您的代码",
+            "copy_link": "复制链接",
+            "support_title": "支持",
+            "create_ticket_button": "创建工单",
+            "currency": "货币",
+            "language": "语言",
+            "select_currency": "选择货币：",
+            "select_language": "选择语言：",
+            "settings_saved": "设置已保存"
+        }
+    }
+    
+    return jsonify(default_translations), 200
+
 
 @app.route('/api/public/system-settings', methods=['GET'])
 def public_system_settings():
     """Публичный эндпоинт для получения публичных системных настроек"""
+    import json
     s = SystemSetting.query.first() or SystemSetting(id=1)
     if not s.id: 
         db.session.add(s)
         db.session.commit()
         if s.show_language_currency_switcher is None:
             s.show_language_currency_switcher = True
+        if not s.active_languages or s.active_languages.strip() == '':
+            s.active_languages = '["ru","ua","en","cn"]'
+        if not s.active_currencies or s.active_currencies.strip() == '':
+            s.active_currencies = '["uah","rub","usd"]'
+        db.session.commit()
+    
+    # Автозаполнение NULL значений
+    needs_save = False
+    if not s.active_languages or s.active_languages.strip() == '':
+        s.active_languages = '["ru","ua","en","cn"]'
+        needs_save = True
+    if not s.active_currencies or s.active_currencies.strip() == '':
+        s.active_currencies = '["uah","rub","usd"]'
+        needs_save = True
+    if needs_save:
+        try:
             db.session.commit()
+        except:
+            db.session.rollback()
+    
+    # Парсим JSON массивы
+    try:
+        active_languages = json.loads(s.active_languages) if s.active_languages else ["ru", "ua", "en", "cn"]
+    except:
+        active_languages = ["ru", "ua", "en", "cn"]
+    
+    try:
+        active_currencies = json.loads(s.active_currencies) if s.active_currencies else ["uah", "rub", "usd"]
+    except:
+        active_currencies = ["uah", "rub", "usd"]
+    
+    print(f"[PUBLIC SYSTEM SETTINGS] active_languages={active_languages}, active_currencies={active_currencies}")
     
     return jsonify({
-        "show_language_currency_switcher": s.show_language_currency_switcher if s.show_language_currency_switcher is not None else True
+        "show_language_currency_switcher": s.show_language_currency_switcher if s.show_language_currency_switcher is not None else True,
+        "active_languages": active_languages,
+        "active_currencies": active_currencies,
+        # Цвета светлой темы
+        "theme_primary_color": getattr(s, 'theme_primary_color', '#3f69ff') or '#3f69ff',
+        "theme_bg_primary": getattr(s, 'theme_bg_primary', '#f8fafc') or '#f8fafc',
+        "theme_bg_secondary": getattr(s, 'theme_bg_secondary', '#eef2ff') or '#eef2ff',
+        "theme_text_primary": getattr(s, 'theme_text_primary', '#0f172a') or '#0f172a',
+        "theme_text_secondary": getattr(s, 'theme_text_secondary', '#64748b') or '#64748b',
+        # Цвета тёмной темы
+        "theme_primary_color_dark": getattr(s, 'theme_primary_color_dark', '#6c7bff') or '#6c7bff',
+        "theme_bg_primary_dark": getattr(s, 'theme_bg_primary_dark', '#050816') or '#050816',
+        "theme_bg_secondary_dark": getattr(s, 'theme_bg_secondary_dark', '#0f172a') or '#0f172a',
+        "theme_text_primary_dark": getattr(s, 'theme_text_primary_dark', '#e2e8f0') or '#e2e8f0',
+        "theme_text_secondary_dark": getattr(s, 'theme_text_secondary_dark', '#94a3b8') or '#94a3b8'
     }), 200
 
 # --- PAYMENT & SUPPORT ---
@@ -9151,6 +10198,108 @@ def init_database():
                     print(f"⚠️  Ошибка при добавлении колонки balance: {e}")
                     conn.rollback()
         
+        # Проверяем наличие таблицы tariff
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tariff'")
+        tariff_table_exists = cursor.fetchone() is not None
+        
+        # Проверяем и добавляем поле hwid_device_limit в таблицу tariff, если его нет
+        if tariff_table_exists:
+            cursor.execute("PRAGMA table_info(tariff)")
+            tariff_columns = [col[1] for col in cursor.fetchall()]
+            if 'hwid_device_limit' not in tariff_columns:
+                print("⚠️  Добавление колонки hwid_device_limit в tariff...")
+                try:
+                    cursor.execute("ALTER TABLE tariff ADD COLUMN hwid_device_limit INTEGER DEFAULT 0")
+                    cursor.execute("UPDATE tariff SET hwid_device_limit = 0 WHERE hwid_device_limit IS NULL")
+                    conn.commit()
+                    print("✓ Колонка hwid_device_limit добавлена в tariff")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при добавлении колонки hwid_device_limit: {e}")
+                    conn.rollback()
+            
+            # Обновляем список колонок после возможного добавления
+            cursor.execute("PRAGMA table_info(tariff)")
+            tariff_columns = [col[1] for col in cursor.fetchall()]
+            
+            if 'bonus_days' not in tariff_columns:
+                print("⚠️  Добавление колонки bonus_days в tariff...")
+                try:
+                    cursor.execute("ALTER TABLE tariff ADD COLUMN bonus_days INTEGER DEFAULT 0")
+                    conn.commit()
+                    print("✓ Колонка bonus_days добавлена в tariff")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при добавлении колонки bonus_days: {e}")
+                    conn.rollback()
+        
+        # Проверяем наличие таблицы system_setting
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='system_setting'")
+        system_setting_table_exists = cursor.fetchone() is not None
+        
+        # Проверяем и добавляем поля active_languages и active_currencies в таблицу system_setting, если их нет
+        if system_setting_table_exists:
+            cursor.execute("PRAGMA table_info(system_setting)")
+            system_setting_columns = [col[1] for col in cursor.fetchall()]
+            default_languages = '["ru","ua","en","cn"]'
+            default_currencies = '["uah","rub","usd"]'
+            
+            if 'active_languages' not in system_setting_columns:
+                print("⚠️  Добавление колонки active_languages в system_setting...")
+                try:
+                    # В SQLite нельзя использовать параметризованные запросы в ALTER TABLE с DEFAULT
+                    cursor.execute("ALTER TABLE system_setting ADD COLUMN active_languages TEXT")
+                    cursor.execute("UPDATE system_setting SET active_languages = ?", (default_languages,))
+                    conn.commit()
+                    print("✓ Колонка active_languages добавлена в system_setting")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при добавлении колонки active_languages: {e}")
+                    conn.rollback()
+            
+            if 'active_currencies' not in system_setting_columns:
+                print("⚠️  Добавление колонки active_currencies в system_setting...")
+                try:
+                    # В SQLite нельзя использовать параметризованные запросы в ALTER TABLE с DEFAULT
+                    cursor.execute("ALTER TABLE system_setting ADD COLUMN active_currencies TEXT")
+                    cursor.execute("UPDATE system_setting SET active_currencies = ?", (default_currencies,))
+                    conn.commit()
+                    print("✓ Колонка active_currencies добавлена в system_setting")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при добавлении колонки active_currencies: {e}")
+                    conn.rollback()
+            
+            # Обновляем список колонок для проверки полей темы
+            cursor.execute("PRAGMA table_info(system_setting)")
+            system_setting_columns = [col[1] for col in cursor.fetchall()]
+            
+            # Колонки для настройки темы
+            theme_columns = [
+                ('theme_primary_color', '#3f69ff'),
+                ('theme_bg_primary', '#f8fafc'),
+                ('theme_bg_secondary', '#eef2ff'),
+                ('theme_text_primary', '#0f172a'),
+                ('theme_text_secondary', '#64748b'),
+                ('theme_primary_color_dark', '#6c7bff'),
+                ('theme_bg_primary_dark', '#050816'),
+                ('theme_bg_secondary_dark', '#0f172a'),
+                ('theme_text_primary_dark', '#e2e8f0'),
+                ('theme_text_secondary_dark', '#94a3b8'),
+            ]
+            
+            for col_name, default_value in theme_columns:
+                # Обновляем список колонок перед каждой проверкой
+                cursor.execute("PRAGMA table_info(system_setting)")
+                system_setting_columns = [col[1] for col in cursor.fetchall()]
+                
+                if col_name not in system_setting_columns:
+                    print(f"⚠️  Добавление колонки {col_name} в system_setting...")
+                    try:
+                        cursor.execute(f"ALTER TABLE system_setting ADD COLUMN {col_name} VARCHAR(20) DEFAULT '{default_value}'")
+                        cursor.execute(f"UPDATE system_setting SET {col_name} = '{default_value}' WHERE {col_name} IS NULL")
+                        conn.commit()
+                        print(f"✓ Колонка {col_name} добавлена в system_setting")
+                    except Exception as e:
+                        print(f"⚠️  Ошибка при добавлении колонки {col_name}: {e}")
+                        conn.rollback()
+        
         # Если таблица payment_setting не существует, создаем её явно
         if not payment_table_exists:
             print("⚠️  Таблица payment_setting не найдена, создаем её...")
@@ -10059,4 +11208,5 @@ def miniapp_static(path):
 if __name__ == '__main__':
     with app.app_context():
         init_database()
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(port=5000, debug=False)
+    app.run(port=5000, debug=False)

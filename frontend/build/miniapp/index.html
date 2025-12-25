@@ -931,9 +931,7 @@
                                 onchange="changeCurrency()"
                                 style="width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-secondary); color: var(--text-primary); font-size: 14px;"
                             >
-                                <option value="uah">₴ UAH</option>
-                                <option value="rub">₽ RUB</option>
-                                <option value="usd">$ USD</option>
+                                <!-- Опции будут добавлены динамически через updateLanguageCurrencySelects() -->
                             </select>
                         </div>
                         <div>
@@ -945,10 +943,7 @@
                                 onchange="changeLanguage()"
                                 style="width: 100%; padding: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-secondary); color: var(--text-primary); font-size: 14px;"
                             >
-                                <option value="ru">🇷🇺 Русский</option>
-                                <option value="ua">🇺🇦 Українська</option>
-                                <option value="en">🇬🇧 English</option>
-                                <option value="cn">🇨🇳 中文</option>
+                                <!-- Опции будут добавлены динамически через updateLanguageCurrencySelects() -->
                             </select>
                         </div>
                     </div>
@@ -1115,6 +1110,7 @@
         let selectedTariffId = null;
         let paymentMethods = [];
         let branding = {};
+        let botConfig = {};
         let serversExpanded = false;
         let currentPage = 'info';
         let appliedPromo = null; // Примененный промокод для тарифов
@@ -1123,6 +1119,9 @@
         // Загружаем валюту из localStorage или используем дефолтную
         let currentCurrency = localStorage.getItem('preferredCurrency') || 'uah';
         let currentLanguage = localStorage.getItem('preferredLanguage') || 'ru';
+        // Активные языки и валюты из настроек
+        let activeLanguages = ['ru', 'ua', 'en', 'cn'];
+        let activeCurrencies = ['uah', 'rub', 'usd'];
 
         // Переводы
         const translations = {
@@ -1609,6 +1608,103 @@
             }
         }
 
+        // Загрузка конфигурации бота
+        async function loadBotConfig() {
+            try {
+                const response = await fetch('/api/public/bot-config');
+                if (response.ok) {
+                    botConfig = await response.json();
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки конфигурации бота:', error);
+            }
+        }
+
+        // Загрузка системных настроек (активные языки и валюты)
+        async function loadSystemSettings() {
+            try {
+                const response = await fetch('/api/public/system-settings');
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.active_languages && Array.isArray(data.active_languages)) {
+                        activeLanguages = data.active_languages;
+                    }
+                    if (data.active_currencies && Array.isArray(data.active_currencies)) {
+                        activeCurrencies = data.active_currencies;
+                    }
+                    // Обновляем селекты после загрузки настроек
+                    updateLanguageCurrencySelects();
+                }
+            } catch (error) {
+                console.error('Ошибка загрузки системных настроек:', error);
+            }
+        }
+
+        // Обновление селектов языков и валют на основе активных
+        function updateLanguageCurrencySelects() {
+            const currencySelect = document.getElementById('currencySelect');
+            const languageSelect = document.getElementById('languageSelect');
+            
+            // Обновляем селект валют
+            if (currencySelect) {
+                const currentValue = currencySelect.value;
+                currencySelect.innerHTML = '';
+                
+                const currencies = [
+                    { code: 'uah', label: '₴ UAH' },
+                    { code: 'rub', label: '₽ RUB' },
+                    { code: 'usd', label: '$ USD' }
+                ];
+                
+                currencies.forEach(curr => {
+                    if (activeCurrencies.includes(curr.code)) {
+                        const option = document.createElement('option');
+                        option.value = curr.code;
+                        option.textContent = curr.label;
+                        currencySelect.appendChild(option);
+                    }
+                });
+                
+                // Устанавливаем текущее значение, если оно активно, иначе первое доступное
+                if (activeCurrencies.includes(currentValue)) {
+                    currencySelect.value = currentValue;
+                } else if (activeCurrencies.length > 0) {
+                    currencySelect.value = activeCurrencies[0];
+                    currentCurrency = activeCurrencies[0];
+                }
+            }
+            
+            // Обновляем селект языков
+            if (languageSelect) {
+                const currentValue = languageSelect.value;
+                languageSelect.innerHTML = '';
+                
+                const languages = [
+                    { code: 'ru', label: '🇷🇺 Русский' },
+                    { code: 'ua', label: '🇺🇦 Українська' },
+                    { code: 'en', label: '🇬🇧 English' },
+                    { code: 'cn', label: '🇨🇳 中文' }
+                ];
+                
+                languages.forEach(lang => {
+                    if (activeLanguages.includes(lang.code)) {
+                        const option = document.createElement('option');
+                        option.value = lang.code;
+                        option.textContent = lang.label;
+                        languageSelect.appendChild(option);
+                    }
+                });
+                
+                // Устанавливаем текущее значение, если оно активно, иначе первое доступное
+                if (activeLanguages.includes(currentValue)) {
+                    languageSelect.value = currentValue;
+                } else if (activeLanguages.length > 0) {
+                    languageSelect.value = activeLanguages[0];
+                    currentLanguage = activeLanguages[0];
+                }
+            }
+        }
+
         function applyBranding() {
             const brandingHeader = document.getElementById('brandingHeader');
             const brandingLogo = document.getElementById('brandingLogo');
@@ -1732,8 +1828,12 @@
                     throw new Error('Нет данных авторизации');
                 }
 
-                // Загружаем брендинг
-                await loadBranding();
+                // Загружаем брендинг, конфигурацию бота и системные настройки
+                await Promise.all([
+                    loadBranding(),
+                    loadBotConfig(),
+                    loadSystemSettings()
+                ]);
 
                 // Загружаем данные подписки
                 const subscriptionResponse = await fetch('/miniapp/subscription', {
@@ -1930,7 +2030,7 @@
                             <p style="color: var(--text-secondary); margin-bottom: 24px; line-height: 1.6;">
                                 ${t('registrationMessage')}
                             </p>
-                            <button class="btn" onclick="window.open('https://t.me/stealthnet_bot', '_blank')" style="width: 100%;">
+                            <button class="btn" onclick="window.open('${botConfig.bot_link_for_miniapp || 'https://t.me/stealthnet_bot'}', '_blank')" style="width: 100%;">
                                 ${t('openBot')}
                             </button>
                         </div>
@@ -2109,10 +2209,10 @@
                 currentCurrency = localStorage.getItem('preferredCurrency');
             }
             
-            const currencySelect = document.getElementById('currencySelect');
-            if (currencySelect) {
-                currencySelect.value = currentCurrency;
-                console.log('Updated currency select to:', currentCurrency);
+            // Проверяем, что валюта активна, иначе выбираем первую доступную
+            if (!activeCurrencies.includes(currentCurrency) && activeCurrencies.length > 0) {
+                currentCurrency = activeCurrencies[0];
+                localStorage.setItem('preferredCurrency', currentCurrency);
             }
 
             // Устанавливаем текущий язык (приоритет: данные пользователя > localStorage > дефолт)
@@ -2123,10 +2223,14 @@
                 currentLanguage = localStorage.getItem('preferredLanguage');
             }
             
-            const languageSelect = document.getElementById('languageSelect');
-            if (languageSelect) {
-                languageSelect.value = currentLanguage;
+            // Проверяем, что язык активен, иначе выбираем первый доступный
+            if (!activeLanguages.includes(currentLanguage) && activeLanguages.length > 0) {
+                currentLanguage = activeLanguages[0];
+                localStorage.setItem('preferredLanguage', currentLanguage);
             }
+            
+            // Обновляем селекты (они уже будут содержать только активные опции)
+            updateLanguageCurrencySelects();
         }
 
         function getServerStatus(server) {
@@ -2235,11 +2339,14 @@
                         console.error('Tariff без ID:', tariff);
                         return '';
                     }
+                    const bonusHtml = Number(tariff.bonus_days) > 0 
+                        ? `<div style="font-size: 11px; color: var(--accent-primary); margin-top: 2px;">+${tariff.bonus_days} ${t('daysWord')}</div>` 
+                        : '';
                     return `
                         <div class="tariff-card" onclick="selectTariff(${tariffId})" style="margin-bottom: 8px; cursor: pointer;">
                             <div class="tariff-info">
                                 <div class="tariff-name">${tariff.name || `${tariff.duration_days} ${t('daysWord')}`}</div>
-                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}</div>
+                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}${bonusHtml}</div>
                             </div>
                             <div class="tariff-price">${price} ${currencyConfig.symbol}</div>
                         </div>
@@ -2257,11 +2364,14 @@
                         console.error('Tariff без ID:', tariff);
                         return '';
                     }
+                    const bonusHtml = Number(tariff.bonus_days) > 0 
+                        ? `<div style="font-size: 11px; color: var(--accent-primary); margin-top: 2px;">+${tariff.bonus_days} ${t('daysWord')}</div>` 
+                        : '';
                     return `
                         <div class="tariff-card" onclick="selectTariff(${tariffId})" style="margin-bottom: 8px; cursor: pointer;">
                             <div class="tariff-info">
                                 <div class="tariff-name">${tariff.name || `${tariff.duration_days} ${t('daysWord')}`}</div>
-                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}</div>
+                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}${bonusHtml}</div>
                             </div>
                             <div class="tariff-price">${price} ${currencyConfig.symbol}</div>
                         </div>
@@ -2279,11 +2389,14 @@
                         console.error('Tariff без ID:', tariff);
                         return '';
                     }
+                    const bonusHtml = Number(tariff.bonus_days) > 0 
+                        ? `<div style="font-size: 11px; color: var(--accent-primary); margin-top: 2px;">+${tariff.bonus_days} ${t('daysWord')}</div>` 
+                        : '';
                     return `
                         <div class="tariff-card" onclick="selectTariff(${tariffId})" style="margin-bottom: 8px; cursor: pointer;">
                             <div class="tariff-info">
                                 <div class="tariff-name">${tariff.name || `${tariff.duration_days} ${t('daysWord')}`}</div>
-                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}</div>
+                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}${bonusHtml}</div>
                             </div>
                             <div class="tariff-price">${price} ${currencyConfig.symbol}</div>
                         </div>
@@ -2341,11 +2454,14 @@
                         console.error('Tariff без ID:', tariff);
                         return '';
                     }
+                    const bonusHtml = Number(tariff.bonus_days) > 0 
+                        ? `<div style="font-size: 11px; color: var(--accent-primary); margin-top: 2px;">+${tariff.bonus_days} ${t('daysWord')}</div>` 
+                        : '';
                     return `
                         <div class="tariff-card ${isSelected ? 'selected' : ''}" onclick="selectTariff(${tariffId})" style="margin-bottom: 8px; cursor: pointer;">
                             <div class="tariff-info">
                                 <div class="tariff-name">${tariff.name || `${tariff.duration_days} ${t('daysWord')}`}</div>
-                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}</div>
+                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}${bonusHtml}</div>
                             </div>
                             <div class="tariff-price">${price} ${currencyConfig.symbol}</div>
                         </div>
@@ -2364,11 +2480,14 @@
                         console.error('Tariff без ID:', tariff);
                         return '';
                     }
+                    const bonusHtml = Number(tariff.bonus_days) > 0 
+                        ? `<div style="font-size: 11px; color: var(--accent-primary); margin-top: 2px;">+${tariff.bonus_days} ${t('daysWord')}</div>` 
+                        : '';
                     return `
                         <div class="tariff-card ${isSelected ? 'selected' : ''}" onclick="selectTariff(${tariffId})" style="margin-bottom: 8px; cursor: pointer;">
                             <div class="tariff-info">
                                 <div class="tariff-name">${tariff.name || `${tariff.duration_days} ${t('daysWord')}`}</div>
-                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}</div>
+                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}${bonusHtml}</div>
                             </div>
                             <div class="tariff-price">${price} ${currencyConfig.symbol}</div>
                         </div>
@@ -2387,11 +2506,14 @@
                         console.error('Tariff без ID:', tariff);
                         return '';
                     }
+                    const bonusHtml = Number(tariff.bonus_days) > 0 
+                        ? `<div style="font-size: 11px; color: var(--accent-primary); margin-top: 2px;">+${tariff.bonus_days} ${t('daysWord')}</div>` 
+                        : '';
                     return `
                         <div class="tariff-card ${isSelected ? 'selected' : ''}" onclick="selectTariff(${tariffId})" style="margin-bottom: 8px; cursor: pointer;">
                             <div class="tariff-info">
                                 <div class="tariff-name">${tariff.name || `${tariff.duration_days} ${t('daysWord')}`}</div>
-                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}</div>
+                                <div class="tariff-duration">${tariff.duration_days} ${t('daysWord')}${bonusHtml}</div>
                             </div>
                             <div class="tariff-price">${price} ${currencyConfig.symbol}</div>
                         </div>
@@ -3138,6 +3260,12 @@
             
             if (newCurrency === currentCurrency) return;
             
+            // Проверяем, что валюта активна
+            if (!activeCurrencies.includes(newCurrency)) {
+                console.warn('Выбранная валюта не активна:', newCurrency);
+                return;
+            }
+            
             currentCurrency = newCurrency;
             
             // Сохраняем в localStorage для следующего открытия
@@ -3167,6 +3295,12 @@
             const newLanguage = select.value;
             
             if (newLanguage === currentLanguage) return;
+            
+            // Проверяем, что язык активен
+            if (!activeLanguages.includes(newLanguage)) {
+                console.warn('Выбранный язык не активен:', newLanguage);
+                return;
+            }
             
             currentLanguage = newLanguage;
             
