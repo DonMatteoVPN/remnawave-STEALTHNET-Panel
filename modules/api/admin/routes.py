@@ -1213,6 +1213,13 @@ def admin_bot_config_endpoint(current_admin):
     try:
         data = request.json
         
+        # Булевые поля, которые должны быть правильно обработаны
+        boolean_fields = {
+            'show_webapp_button', 'show_trial_button', 'show_referral_button',
+            'show_support_button', 'show_servers_button', 'show_agreement_button',
+            'show_offer_button', 'show_topup_button', 'require_channel_subscription'
+        }
+        
         # Простые поля
         simple_fields = ['service_name', 'bot_username', 'support_url', 'support_bot_username',
                         'show_webapp_button', 'show_trial_button', 'show_referral_button',
@@ -1228,7 +1235,30 @@ def admin_bot_config_endpoint(current_admin):
         
         for field in simple_fields:
             if field in data:
-                setattr(config, field, data[field])
+                # Для булевых полей преобразуем значение в bool
+                if field in boolean_fields:
+                    value = data[field]
+                    # Обрабатываем разные форматы: bool, str "true"/"false", int 0/1
+                    if isinstance(value, bool):
+                        setattr(config, field, value)
+                    elif isinstance(value, str):
+                        setattr(config, field, value.lower() in ('true', '1', 'yes', 'on'))
+                    elif isinstance(value, (int, float)):
+                        setattr(config, field, bool(value))
+                    else:
+                        setattr(config, field, False)
+                elif field == 'channel_id':
+                    # Нормализуем channel_id: убираем @ если есть
+                    value = data[field]
+                    if isinstance(value, str):
+                        value = value.strip()
+                        if value.startswith('@'):
+                            value = value[1:]
+                        setattr(config, field, value)
+                    else:
+                        setattr(config, field, str(value) if value else '')
+                else:
+                    setattr(config, field, data[field])
         
         # JSON поля
         json_fields = ['translations_ru', 'translations_ua', 'translations_en', 'translations_cn', 'buttons_order']
