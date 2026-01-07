@@ -1562,6 +1562,26 @@ def tariff_features_settings(current_admin):
                 db.session.add(setting)
             setting.features = json.dumps(features, ensure_ascii=False) if isinstance(features, list) else features
         db.session.commit()
+        
+        # Очищаем кеш функций тарифов
+        cache.delete('flask_cache_view//api/public/tariff-features')
+        cache.delete('view//api/public/tariff-features')
+        cache.delete('get_public_tariff_features')
+        # Также очищаем все ключи с 'tariff-feature' в названии через Redis напрямую
+        try:
+            import redis
+            redis_host = os.getenv("REDIS_HOST", "localhost")
+            redis_port = int(os.getenv("REDIS_PORT", 6379))
+            redis_db = int(os.getenv("REDIS_DB", 0))
+            redis_password = os.getenv("REDIS_PASSWORD", None)
+            r = redis.Redis(host=redis_host, port=redis_port, db=redis_db, password=redis_password, decode_responses=True)
+            keys = r.keys('*tariff-feature*')
+            if keys:
+                r.delete(*keys)
+                print(f"[CACHE] Deleted {len(keys)} tariff-feature cache keys")
+        except Exception as e:
+            print(f"[CACHE] Error clearing tariff-feature cache: {e}")
+        
         return jsonify({"message": "Tariff features updated successfully"}), 200
     except Exception as e:
         db.session.rollback()
