@@ -177,6 +177,10 @@ def process_successful_payment(payment, user, tariff):
         if tariff.traffic_limit_bytes and tariff.traffic_limit_bytes > 0:
             patch_payload["trafficLimitBytes"] = tariff.traffic_limit_bytes
             patch_payload["trafficLimitStrategy"] = "NO_RESET"
+            
+            # Устанавливаем лимит устройств, если он указан в тарифе
+        if hasattr(tariff, 'hwid_device_limit') and tariff.hwid_device_limit is not None and tariff.hwid_device_limit > 0:
+            patch_payload["hwidDeviceLimit"] = tariff.hwid_device_limit
         
         h, c = get_remnawave_headers({"Content-Type": "application/json"})
         patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
