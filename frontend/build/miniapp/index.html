@@ -918,21 +918,47 @@
                 <div class="card glass-card info-card softer-card">
                     <h3 class="client-widget-title" id="referralProgramTitle">Реферальная программа</h3>
                     <div class="referral-section">
-                        <div class="input-with-button">
-                            <input 
-                                type="text" 
-                                id="referralLinkInput" 
-                                readonly
-                                style="flex: 1; padding: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-secondary); color: var(--text-primary);"
-                            />
-                            <button 
-                                class="btn" 
-                                onclick="copyReferralLink()" 
-                                id="referralCopyBtn"
-                                style="padding: 12px 20px;"
-                            >
-                                📋
-                            </button>
+                        <div style="margin-bottom: 16px;">
+                            <label style="display: block; margin-bottom: 8px; font-size: 14px; color: var(--text-secondary); font-weight: 600;">
+                                🔗 <span id="referralLinkSiteLabel">Ссылка на сайт</span>
+                            </label>
+                            <div class="input-with-button">
+                                <input 
+                                    type="text" 
+                                    id="referralLinkInput" 
+                                    readonly
+                                    style="flex: 1; padding: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-secondary); color: var(--text-primary);"
+                                />
+                                <button 
+                                    class="btn" 
+                                    onclick="copyReferralLink()" 
+                                    id="referralCopyBtn"
+                                    style="padding: 12px 20px;"
+                                >
+                                    📋
+                                </button>
+                            </div>
+                        </div>
+                        <div style="margin-bottom: 10px;">
+                            <label style="display: block; margin-bottom: 8px; font-size: 14px; color: var(--text-secondary); font-weight: 600;">
+                                🤖 <span id="referralLinkBotLabel">Ссылка на бота</span>
+                            </label>
+                            <div class="input-with-button">
+                                <input 
+                                    type="text" 
+                                    id="referralBotLinkInput" 
+                                    readonly
+                                    style="flex: 1; padding: 12px; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-secondary); color: var(--text-primary);"
+                                />
+                                <button 
+                                    class="btn" 
+                                    onclick="copyReferralBotLink()" 
+                                    id="referralBotCopyBtn"
+                                    style="padding: 12px 20px;"
+                                >
+                                    📋
+                                </button>
+                            </div>
                         </div>
                         <div id="shareLinkText" style="margin-top: 10px; font-size: 13px; color: var(--text-secondary);">
                             Поделитесь ссылкой с друзьями и получите бонусы!
@@ -1138,6 +1164,7 @@
         let appliedPromo = null; // Примененный промокод для тарифов
         let tickets = []; // Список тикетов
         let serverDomain = 'panel.stealthnet.app'; // Домен сервера для рефералки
+        let botUsername = ''; // Username бота для реферальной ссылки
         // Загружаем валюту из localStorage или используем дефолтную
         let currentCurrency = localStorage.getItem('preferredCurrency') || 'uah';
         let currentLanguage = localStorage.getItem('preferredLanguage') || 'ru';
@@ -1169,6 +1196,8 @@
                 referralProgram: 'Реферальная программа',
                 shareLink: 'Поделитесь ссылкой с друзьями и получите бонусы!',
                 referralCodeNotFound: 'Реферальный код не найден',
+                referralLinkSite: 'Ссылка на сайт',
+                referralLinkBot: 'Ссылка на бота',
                 linkCopied: 'Ссылка скопирована!',
                 settings: 'Настройки',
                 currency: 'Валюта',
@@ -1250,6 +1279,8 @@
                 referralProgram: 'Реферальна програма',
                 shareLink: 'Поділіться посиланням з друзями та отримайте бонуси!',
                 referralCodeNotFound: 'Реферальний код не знайдено',
+                referralLinkSite: 'Посилання на сайт',
+                referralLinkBot: 'Посилання на бота',
                 linkCopied: 'Посилання скопійовано!',
                 settings: 'Налаштування',
                 currency: 'Валюта',
@@ -1331,6 +1362,8 @@
                 referralProgram: 'Referral Program',
                 shareLink: 'Share the link with friends and get bonuses!',
                 referralCodeNotFound: 'Referral code not found',
+                referralLinkSite: 'Website link',
+                referralLinkBot: 'Bot link',
                 linkCopied: 'Link copied!',
                 settings: 'Settings',
                 currency: 'Currency',
@@ -1412,6 +1445,8 @@
                 referralProgram: '推荐计划',
                 shareLink: '与朋友分享链接并获得奖励！',
                 referralCodeNotFound: '未找到推荐代码',
+                referralLinkSite: '网站链接',
+                referralLinkBot: '机器人链接',
                 linkCopied: '链接已复制！',
                 settings: '设置',
                 currency: '货币',
@@ -1551,6 +1586,12 @@
             // Обновляем текст реферальной программы
             const shareLinkText = document.getElementById('shareLinkText');
             if (shareLinkText) shareLinkText.textContent = t('shareLink');
+            
+            const referralLinkSiteLabel = document.getElementById('referralLinkSiteLabel');
+            if (referralLinkSiteLabel) referralLinkSiteLabel.textContent = t('referralLinkSite');
+            
+            const referralLinkBotLabel = document.getElementById('referralLinkBotLabel');
+            if (referralLinkBotLabel) referralLinkBotLabel.textContent = t('referralLinkBot');
 
             // Обновляем навигацию
             const navInfo = document.getElementById('navInfo')?.querySelector('.nav-item-label');
@@ -1636,6 +1677,19 @@
                 const response = await fetch('/api/public/bot-config');
                 if (response.ok) {
                     botConfig = await response.json();
+                    // Получаем username бота из конфигурации
+                    botUsername = botConfig.bot_username || botConfig.username || '';
+                    // Убираем @ если есть
+                    if (botUsername && botUsername.startsWith('@')) {
+                        botUsername = botUsername.substring(1);
+                    }
+                    // Если нет в конфигурации, пробуем получить из bot_link_for_miniapp
+                    if (!botUsername && botConfig.bot_link_for_miniapp) {
+                        const match = botConfig.bot_link_for_miniapp.match(/t\.me\/([^\/\?]+)/);
+                        if (match) {
+                            botUsername = match[1];
+                        }
+                    }
                 }
             } catch (error) {
                 console.error('Ошибка загрузки конфигурации бота:', error);
@@ -1807,11 +1861,12 @@
         }
 
         function getSubscriptionUrl() {
+            // Используем subscriptionUrl из данных пользователя (это ссылка на Remmina subscription page)
             if (userData && userData.subscriptionUrl) {
                 return userData.subscriptionUrl;
             }
-            // Если нет subscriptionUrl, возвращаем ссылку на панель
-            return 'https://panel.stealthnet.app/dashboard/subscription';
+            // Если нет subscriptionUrl, возвращаем null (кнопка не будет показана)
+            return null;
         }
 
         function switchPage(page) {
@@ -1851,7 +1906,10 @@
             event.stopPropagation();
             const url = getSubscriptionUrl();
             if (url) {
+                // Открываем subscription URL в Remmina (как в боте)
                 tg.openLink(url);
+            } else {
+                tg.showAlert(t('error') + ': ' + t('notAvailable'));
             }
         }
 
@@ -1863,11 +1921,13 @@
             
             if (!connectBtnContainer || !connectBtn || !connectBtnText) return;
 
-            // Показываем кнопку только на странице "Информация"
+            // Показываем кнопку только на странице "Информация" и когда подписка активна
             const isOnInfoPage = currentPage === 'info';
             const isActive = userData && userData.activeInternalSquads && userData.activeInternalSquads.length > 0;
+            const subscriptionUrl = getSubscriptionUrl(); // Получаем subscriptionUrl для Remmina
             
-            if (isOnInfoPage && isActive && userData.subscriptionUrl) {
+            // Показываем кнопку только если есть активная подписка И subscriptionUrl (ссылка на Remmina)
+            if (isOnInfoPage && isActive && subscriptionUrl) {
                 connectBtnContainer.style.display = 'block';
                 connectBtnText.textContent = t('connect');
             } else {
@@ -1915,6 +1975,14 @@
 
                 const subscriptionData = await subscriptionResponse.json();
                 userData = subscriptionData.response || subscriptionData;
+                
+                // Обрабатываем subscriptionUrl из разных форматов ответа
+                if (subscriptionData.subscription_url && !userData.subscriptionUrl) {
+                    userData.subscriptionUrl = subscriptionData.subscription_url;
+                }
+                if (!userData.subscriptionUrl && userData.subscription_url) {
+                    userData.subscriptionUrl = userData.subscription_url;
+                }
                 
                 // Проверяем, зарегистрирован ли пользователь
                 if (!userData || (!userData.telegram_id && !userData.id)) {
@@ -2008,7 +2076,7 @@
                 }, 100);
                 
                 // Обновляем реферальную ссылку после загрузки данных
-                // Ждем немного, чтобы serverDomain успел загрузиться
+                // Ждем немного, чтобы serverDomain и botConfig успели загрузиться
                 setTimeout(() => {
                     updateReferralLink();
                 }, 1000);
@@ -3103,6 +3171,7 @@
             }
             
             const input = document.getElementById('referralLinkInput');
+            const botInput = document.getElementById('referralBotLinkInput');
             
             if (!referralCode) {
                 console.log('referral_code still not found after all attempts');
@@ -3113,10 +3182,15 @@
                     input.style.color = 'var(--text-secondary)';
                     input.style.fontStyle = 'italic';
                 }
+                if (botInput) {
+                    botInput.value = t('referralCodeNotFound');
+                    botInput.style.color = 'var(--text-secondary)';
+                    botInput.style.fontStyle = 'italic';
+                }
                 return;
             }
             
-            // Если referral_code найден, сбрасываем стили и устанавливаем ссылку
+            // Обновляем ссылку на сайт
             if (input) {
                 input.style.color = '';
                 input.style.fontStyle = '';
@@ -3130,6 +3204,37 @@
             } else {
                 console.log('referralLinkInput element not found');
             }
+            
+            // Обновляем ссылку на бота
+            if (botInput && referralCode) {
+                botInput.style.color = '';
+                botInput.style.fontStyle = '';
+                
+                // Если botUsername еще не загружен, пробуем получить его
+                if (!botUsername) {
+                    // Пробуем получить из botConfig
+                    if (botConfig.bot_username) {
+                        botUsername = botConfig.bot_username;
+                        if (botUsername.startsWith('@')) {
+                            botUsername = botUsername.substring(1);
+                        }
+                    } else if (botConfig.bot_link_for_miniapp) {
+                        const match = botConfig.bot_link_for_miniapp.match(/t\.me\/([^\/\?]+)/);
+                        if (match) {
+                            botUsername = match[1];
+                        }
+                    }
+                }
+                
+                // Если все еще нет botUsername, используем дефолтное значение
+                if (!botUsername) {
+                    botUsername = 'stealthnet_vpn_bot'; // Fallback
+                }
+                
+                const botReferralLink = `https://t.me/${botUsername}?start=${referralCode}`;
+                console.log('Generated bot referral link:', botReferralLink);
+                botInput.value = botReferralLink;
+            }
         }
 
         async function copyReferralLink() {
@@ -3142,7 +3247,27 @@
                 await navigator.clipboard.writeText(input.value);
                 const originalText = btn.textContent;
                 btn.textContent = '✓';
-                tg.showAlert('Ссылка скопирована!');
+                tg.showAlert(t('linkCopied'));
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                }, 2000);
+            } catch (error) {
+                console.error('Ошибка копирования:', error);
+                tg.showAlert(t('errorCopy'));
+            }
+        }
+
+        async function copyReferralBotLink() {
+            const input = document.getElementById('referralBotLinkInput');
+            const btn = document.getElementById('referralBotCopyBtn');
+            
+            if (!input || !input.value) return;
+            
+            try {
+                await navigator.clipboard.writeText(input.value);
+                const originalText = btn.textContent;
+                btn.textContent = '✓';
+                tg.showAlert(t('linkCopied'));
                 setTimeout(() => {
                     btn.textContent = originalText;
                 }, 2000);
