@@ -14,7 +14,8 @@ from modules.core import get_db, get_app
 app = get_app()
 db = get_db()
 
-with app.app_context():
+def add_button_fields():
+    """Добавить поля кнопок в таблицу auto_broadcast_message"""
     try:
         from sqlalchemy import inspect, text
         from sqlalchemy.exc import ProgrammingError, OperationalError
@@ -99,6 +100,10 @@ with app.app_context():
             traceback.print_exc()
             db.session.rollback()
             # Не поднимаем исключение, чтобы не прервать другие миграции
+
+# Выполняем миграцию в контексте приложения
+with app.app_context():
+    add_button_fields()
 
 
 
