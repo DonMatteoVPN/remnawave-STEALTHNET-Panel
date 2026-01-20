@@ -11,6 +11,7 @@ API эндпоинты администратора
 - GET/POST /api/admin/tariffs - Тарифы
 - GET/POST /api/admin/promo-codes - Промокоды
 - GET/POST /api/admin/referral-settings - Настройки рефералов
+- GET/POST /api/admin/trial-settings - Настройки триала
 - GET/POST /api/admin/tariff-features - Функции тарифов
 - GET/POST /api/admin/currency-rates - Курсы валют
 - POST /api/admin/broadcast - Рассылка
@@ -35,7 +36,8 @@ from modules.models.bot_config import BotConfig
 from modules.models.referral import ReferralSetting
 from modules.models.tariff_feature import TariffFeatureSetting
 from modules.models.currency import CurrencyRate
-from modules.models.auto_broadcast import AutoBroadcastMessage
+from modules.models.auto_broadcast import AutoBroadcastMessage, AutoBroadcastSettings
+from modules.models.trial import TrialSettings
 
 app = get_app()
 db = get_db()
@@ -109,10 +111,27 @@ def get_admin_users(current_admin):
             # Пытаемся найти пользователя в RemnaWave
             live_data = None
             fetch_error = None
+            primary_uuid = None
+            
+            # Если включены несколько конфигов (UserConfig), то remnawave_uuid у User должен быть равен UUID основного конфига.
+            # Ранее здесь был авто-апдейт UUID по email/username из RemnaWave, но при нескольких конфигурациях это опасно:
+            # - email может совпадать у разных конфигов
+            # - live_map_by_email становится неоднозначным
+            # и в итоге u.remnawave_uuid начинает "прыгать", ломая оплаты/уведомления.
+            try:
+                from modules.models.user_config import UserConfig
+                primary_cfg = UserConfig.query.filter_by(user_id=u.id, is_primary=True).first()
+                if primary_cfg and primary_cfg.remnawave_uuid:
+                    primary_uuid = primary_cfg.remnawave_uuid
+                    if u.remnawave_uuid != primary_uuid:
+                        u.remnawave_uuid = primary_uuid
+            except Exception:
+                primary_uuid = None
             
             # Сначала ищем по UUID
-            if u.remnawave_uuid:
-                live_data = live_map.get(u.remnawave_uuid)
+            uuid_for_lookup = primary_uuid or u.remnawave_uuid
+            if uuid_for_lookup:
+                live_data = live_map.get(uuid_for_lookup)
             
             # Если не нашли по UUID, пробуем найти по email
             if not live_data and u.email:
@@ -125,10 +144,6 @@ def get_admin_users(current_admin):
                 for email_var in email_variants:
                     if email_var in live_map_by_email:
                         live_data = live_map_by_email[email_var]
-                        # Если нашли по email, обновляем UUID в БД (но не коммитим сразу, чтобы не делать много коммитов)
-                        if live_data and live_data.get('uuid') and live_data.get('uuid') != u.remnawave_uuid:
-                            print(f"Updating UUID for user {u.email}: {u.remnawave_uuid} -> {live_data.get('uuid')}")
-                            u.remnawave_uuid = live_data.get('uuid')
                         break
             
             if u.remnawave_uuid and not live_data:
@@ -182,6 +197,18 @@ def delete_user(current_admin, user_id):
         tickets_count = Ticket.query.filter_by(user_id=user_id).count()
         ticket_messages_count = TicketMessage.query.filter_by(sender_id=user_id).count()
         referrals_count = User.query.filter_by(referrer_id=user_id).count()
+        user_configs_count = 0
+        casino_games_count = 0
+        try:
+            from modules.models.user_config import UserConfig
+            user_configs_count = UserConfig.query.filter_by(user_id=user_id).count()
+        except Exception:
+            user_configs_count = 0
+        try:
+            from modules.models.casino import CasinoGame
+            casino_games_count = CasinoGame.query.filter_by(user_id=user_id).count()
+        except Exception:
+            casino_games_count = 0
         
         # Если есть связанные данные, удаляем их каскадно
         if payments_count > 0:
@@ -201,6 +228,22 @@ def delete_user(current_admin, user_id):
         # Обнуляем referrer_id у пользователей, которые были приглашены этим пользователем
         if referrals_count > 0:
             User.query.filter_by(referrer_id=user_id).update({'referrer_id': None})
+
+        # Удаляем конфиги пользователя (иначе при db.session.delete(user) SQLAlchemy попытается выставить user_id=NULL)
+        if user_configs_count > 0:
+            try:
+                from modules.models.user_config import UserConfig
+                UserConfig.query.filter_by(user_id=user_id).delete()
+            except Exception as e:
+                print(f"Warning: failed to delete user configs for user {user_id}: {e}")
+
+        # Удаляем историю казино пользователя
+        if casino_games_count > 0:
+            try:
+                from modules.models.casino import CasinoGame
+                CasinoGame.query.filter_by(user_id=user_id).delete()
+            except Exception as e:
+                print(f"Warning: failed to delete casino games for user {user_id}: {e}")
         
         # Сохраняем UUID перед удалением для удаления из RemnaWave
         remnawave_uuid = user.remnawave_uuid
@@ -239,6 +282,8 @@ def delete_user(current_admin, user_id):
                 "tickets": tickets_count,
                 "ticket_messages": ticket_messages_count,
                 "referrals_cleared": referrals_count,
+                "user_configs": user_configs_count,
+                "casino_games": casino_games_count,
                 "remnawave_deleted": remnawave_uuid is not None
             }
         }), 200
@@ -350,10 +395,16 @@ def update_user_referral_percent(current_admin, user_id):
             return jsonify({"message": "Пользователь не найден"}), 404
         
         data = request.json
-        referral_percent = data.get('referral_percent')
-        
-        if referral_percent is None:
-            return jsonify({"message": "referral_percent is required"}), 400
+        referral_percent = data.get('referral_percent') if isinstance(data, dict) else None
+
+        # NULL/пусто => использовать процент по умолчанию (динамически)
+        if referral_percent is None or referral_percent == "":
+            u.referral_percent = None
+            db.session.commit()
+            return jsonify({
+                "message": "Процент реферала сброшен (используется процент по умолчанию)",
+                "referral_percent": None
+            }), 200
         
         try:
             referral_percent = float(referral_percent)
@@ -375,6 +426,29 @@ def update_user_referral_percent(current_admin, user_id):
         import traceback
         traceback.print_exc()
         return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
+
+
+@app.route('/api/admin/referral-settings/reset-user-percents', methods=['POST'])
+@admin_required
+def reset_all_user_referral_percents(current_admin):
+    """
+    Сбросить индивидуальные referral_percent у пользователей (сделать NULL),
+    чтобы у всех начал применяться referral_setting.default_referral_percent динамически.
+    """
+    try:
+        # Обновляем только там, где значение не NULL (иначе бессмысленно)
+        affected = User.query.filter(User.referral_percent.isnot(None)).update(
+            {"referral_percent": None},
+            synchronize_session=False
+        )
+        db.session.commit()
+        return jsonify({"message": "User referral percents reset", "affected": int(affected or 0)}), 200
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error resetting user referral percents: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Failed to reset user referral percents"}), 500
 
 
 @app.route('/api/admin/users/<int:user_id>/block', methods=['POST'])
@@ -1120,9 +1194,16 @@ def admin_branding_settings(current_admin):
             'subscription_trial_text', 'balance_label_text', 'referral_code_label_text'
         ]
         
+        # Булевые поля, которые не должны быть None
+        boolean_fields = {'quick_download_enabled'}
+        
         for key in fields:
             if key in data:
-                setattr(b, key, data[key] if data[key] else None)
+                # Для булевых полей сохраняем значение как есть (включая False)
+                if key in boolean_fields:
+                    setattr(b, key, bool(data[key]) if data[key] is not None else True)
+                else:
+                    setattr(b, key, data[key] if data[key] else None)
         
         # Обработка JSON поля для названий функций тарифов
         if 'tariff_features_names' in data:
@@ -1206,6 +1287,13 @@ def admin_bot_config_endpoint(current_admin):
     try:
         data = request.json
         
+        # Булевые поля, которые должны быть правильно обработаны
+        boolean_fields = {
+            'show_webapp_button', 'show_trial_button', 'show_referral_button',
+            'show_support_button', 'show_servers_button', 'show_agreement_button',
+            'show_offer_button', 'show_topup_button', 'require_channel_subscription'
+        }
+        
         # Простые поля
         simple_fields = ['service_name', 'bot_username', 'support_url', 'support_bot_username',
                         'show_webapp_button', 'show_trial_button', 'show_referral_button',
@@ -1221,7 +1309,30 @@ def admin_bot_config_endpoint(current_admin):
         
         for field in simple_fields:
             if field in data:
-                setattr(config, field, data[field])
+                # Для булевых полей преобразуем значение в bool
+                if field in boolean_fields:
+                    value = data[field]
+                    # Обрабатываем разные форматы: bool, str "true"/"false", int 0/1
+                    if isinstance(value, bool):
+                        setattr(config, field, value)
+                    elif isinstance(value, str):
+                        setattr(config, field, value.lower() in ('true', '1', 'yes', 'on'))
+                    elif isinstance(value, (int, float)):
+                        setattr(config, field, bool(value))
+                    else:
+                        setattr(config, field, False)
+                elif field == 'channel_id':
+                    # Нормализуем channel_id: убираем @ если есть
+                    value = data[field]
+                    if isinstance(value, str):
+                        value = value.strip()
+                        if value.startswith('@'):
+                            value = value[1:]
+                        setattr(config, field, value)
+                    else:
+                        setattr(config, field, str(value) if value else '')
+                else:
+                    setattr(config, field, data[field])
         
         # JSON поля
         json_fields = ['translations_ru', 'translations_ua', 'translations_en', 'translations_cn', 'buttons_order']
@@ -1421,6 +1532,14 @@ def delete_tariff(current_admin, tariff_id=None, id=None):
         tariff = db.session.get(Tariff, tariff_id)
         if not tariff:
             return jsonify({"message": "Tariff not found"}), 404
+        
+        # Перед удалением тарифа обнуляем tariff_id в связанных платежах
+        # Это позволяет сохранить историю платежей, но убрать ссылку на удаляемый тариф
+        payments_updated = Payment.query.filter_by(tariff_id=tariff_id).update({Payment.tariff_id: None})
+        if payments_updated > 0:
+            print(f"[TARIFF] Updated {payments_updated} payment(s) to remove tariff reference")
+        
+        # Теперь можно безопасно удалить тариф
         db.session.delete(tariff)
         db.session.commit()
         
@@ -1443,10 +1562,17 @@ def delete_tariff(current_admin, tariff_id=None, id=None):
         except Exception as e:
             print(f"[CACHE] Error clearing cache: {e}")
         
+        print(f"[TARIFF] Deleted tariff: id={tariff_id}")
         return jsonify({"message": "Tariff deleted successfully"}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"message": "Internal Server Error"}), 500
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[TARIFF] Error deleting tariff {tariff_id}: {e}")
+        print(f"[TARIFF] Traceback: {error_trace}")
+        return jsonify({
+            "message": f"Internal Server Error: {str(e)}"
+        }), 500
 
 
 # ============================================================================
@@ -1488,6 +1614,141 @@ def ref_settings(current_admin):
 
 
 # ============================================================================
+# TRIAL SETTINGS
+# ============================================================================
+
+@app.route('/api/admin/trial-settings', methods=['GET', 'POST'])
+@admin_required
+def admin_trial_settings(current_admin):
+    """Настройки триального периода"""
+    from modules.models.trial import get_trial_settings
+    
+    settings = get_trial_settings()
+    
+    if request.method == 'GET':
+        return jsonify({
+            "days": settings.days,
+            "devices": settings.devices,
+            "traffic_limit_bytes": settings.traffic_limit_bytes,
+            "title_ru": settings.title_ru or "",
+            "title_ua": settings.title_ua or "",
+            "title_en": settings.title_en or "",
+            "title_cn": settings.title_cn or "",
+            "description_ru": settings.description_ru or "",
+            "description_ua": settings.description_ua or "",
+            "description_en": settings.description_en or "",
+            "description_cn": settings.description_cn or "",
+            "button_text_ru": settings.button_text_ru or "",
+            "button_text_ua": settings.button_text_ua or "",
+            "button_text_en": settings.button_text_en or "",
+            "button_text_cn": settings.button_text_cn or "",
+            "activation_message_ru": settings.activation_message_ru or "",
+            "activation_message_ua": settings.activation_message_ua or "",
+            "activation_message_en": settings.activation_message_en or "",
+            "activation_message_cn": settings.activation_message_cn or "",
+            "enabled": settings.enabled
+        }), 200
+    
+    try:
+        data = request.json
+        
+        if 'days' in data:
+            settings.days = int(data.get('days', 3))
+        if 'devices' in data:
+            settings.devices = int(data.get('devices', 3))
+        if 'traffic_limit_bytes' in data:
+            settings.traffic_limit_bytes = int(data.get('traffic_limit_bytes', 0))
+        if 'title_ru' in data:
+            settings.title_ru = data.get('title_ru', '')
+        if 'title_ua' in data:
+            settings.title_ua = data.get('title_ua', '')
+        if 'title_en' in data:
+            settings.title_en = data.get('title_en', '')
+        if 'title_cn' in data:
+            settings.title_cn = data.get('title_cn', '')
+        if 'description_ru' in data:
+            settings.description_ru = data.get('description_ru', '')
+        if 'description_ua' in data:
+            settings.description_ua = data.get('description_ua', '')
+        if 'description_en' in data:
+            settings.description_en = data.get('description_en', '')
+        if 'description_cn' in data:
+            settings.description_cn = data.get('description_cn', '')
+        if 'button_text_ru' in data:
+            settings.button_text_ru = data.get('button_text_ru', '')
+        if 'button_text_ua' in data:
+            settings.button_text_ua = data.get('button_text_ua', '')
+        if 'button_text_en' in data:
+            settings.button_text_en = data.get('button_text_en', '')
+        if 'button_text_cn' in data:
+            settings.button_text_cn = data.get('button_text_cn', '')
+        if 'activation_message_ru' in data:
+            settings.activation_message_ru = data.get('activation_message_ru', '')
+        if 'activation_message_ua' in data:
+            settings.activation_message_ua = data.get('activation_message_ua', '')
+        if 'activation_message_en' in data:
+            settings.activation_message_en = data.get('activation_message_en', '')
+        if 'activation_message_cn' in data:
+            settings.activation_message_cn = data.get('activation_message_cn', '')
+        if 'enabled' in data:
+            settings.enabled = bool(data.get('enabled', True))
+        
+        db.session.add(settings)
+        db.session.commit()
+        
+        # Очищаем кэш (если используется)
+        try:
+            cache.delete('trial_settings')
+        except:
+            pass
+        
+        return jsonify({"message": "Trial settings updated"}), 200
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        print(f"Error updating trial settings: {e}")
+        return jsonify({"message": f"Failed to update trial settings: {str(e)}"}), 500
+
+
+@app.route('/api/public/trial-settings', methods=['GET'])
+def public_trial_settings():
+    """Публичный endpoint для получения настроек триала (для фронтенда)"""
+    from modules.models.trial import get_trial_settings
+    
+    settings = get_trial_settings()
+    
+    # Форматируем текст, заменяя {days} на актуальное значение
+    def format_text(text, days):
+        if not text:
+            return ""
+        return text.replace("{days}", str(days))
+    
+    return jsonify({
+        "days": settings.days,
+        "devices": settings.devices,
+        "traffic_limit_bytes": settings.traffic_limit_bytes,
+        "enabled": settings.enabled,
+        "title_ru": format_text(settings.title_ru, settings.days),
+        "title_ua": format_text(settings.title_ua, settings.days),
+        "title_en": format_text(settings.title_en, settings.days),
+        "title_cn": format_text(settings.title_cn, settings.days),
+        "description_ru": format_text(settings.description_ru, settings.days),
+        "description_ua": format_text(settings.description_ua, settings.days),
+        "description_en": format_text(settings.description_en, settings.days),
+        "description_cn": format_text(settings.description_cn, settings.days),
+        "button_text_ru": format_text(settings.button_text_ru, settings.days),
+        "button_text_ua": format_text(settings.button_text_ua, settings.days),
+        "button_text_en": format_text(settings.button_text_en, settings.days),
+        "button_text_cn": format_text(settings.button_text_cn, settings.days),
+        "activation_message_ru": format_text(settings.activation_message_ru, settings.days),
+        "activation_message_ua": format_text(settings.activation_message_ua, settings.days),
+        "activation_message_en": format_text(settings.activation_message_en, settings.days),
+        "activation_message_cn": format_text(settings.activation_message_cn, settings.days)
+    }), 200
+
+
+# ============================================================================
 # TARIFF FEATURES
 # ============================================================================
 
@@ -1525,6 +1786,26 @@ def tariff_features_settings(current_admin):
                 db.session.add(setting)
             setting.features = json.dumps(features, ensure_ascii=False) if isinstance(features, list) else features
         db.session.commit()
+        
+        # Очищаем кеш функций тарифов
+        cache.delete('flask_cache_view//api/public/tariff-features')
+        cache.delete('view//api/public/tariff-features')
+        cache.delete('get_public_tariff_features')
+        # Также очищаем все ключи с 'tariff-feature' в названии через Redis напрямую
+        try:
+            import redis
+            redis_host = os.getenv("REDIS_HOST", "localhost")
+            redis_port = int(os.getenv("REDIS_PORT", 6379))
+            redis_db = int(os.getenv("REDIS_DB", 0))
+            redis_password = os.getenv("REDIS_PASSWORD", None)
+            r = redis.Redis(host=redis_host, port=redis_port, db=redis_db, password=redis_password, decode_responses=True)
+            keys = r.keys('*tariff-feature*')
+            if keys:
+                r.delete(*keys)
+                print(f"[CACHE] Deleted {len(keys)} tariff-feature cache keys")
+        except Exception as e:
+            print(f"[CACHE] Error clearing tariff-feature cache: {e}")
+        
         return jsonify({"message": "Tariff features updated successfully"}), 200
     except Exception as e:
         db.session.rollback()
@@ -1992,11 +2273,33 @@ def handle_promos(current_admin):
 @admin_required
 def delete_promo(current_admin, id):
     """Удаление промокода"""
-    c = db.session.get(PromoCode, id)
-    if c:
+    try:
+        c = db.session.get(PromoCode, id)
+        if not c:
+            return jsonify({"message": "Promo code not found"}), 404
+        
+        # Проверяем, используется ли промокод в платежах
+        payments_count = Payment.query.filter_by(promo_code_id=id).count()
+        
+        if payments_count > 0:
+            # Обнуляем promo_code_id в связанных платежах перед удалением
+            Payment.query.filter_by(promo_code_id=id).update({'promo_code_id': None})
+            db.session.commit()
+        
+        # Удаляем промокод
         db.session.delete(c)
         db.session.commit()
-    return jsonify({"message": "Deleted"}), 200
+        
+        return jsonify({"message": "Deleted"}), 200
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"[PROMOCODE] Error deleting promo code {id}: {e}")
+        print(f"[PROMOCODE] Traceback: {error_trace}")
+        return jsonify({
+            "message": f"Failed to delete promo code: {str(e)}"
+        }), 500
 
 
 @app.route('/api/admin/promocodes/<int:id>', methods=['PATCH'])
@@ -2042,6 +2345,181 @@ def update_promo(current_admin, id):
         }), 200
     except Exception as e:
         return jsonify({"message": str(e)}), 500
+
+
+# ============================================================================
+# AUTO BROADCAST MESSAGES
+# ============================================================================
+
+@app.route('/api/admin/auto-broadcast-messages', methods=['GET', 'POST'])
+@admin_required
+def auto_broadcast_messages(current_admin):
+    """Управление автоматическими сообщениями"""
+    try:
+        if request.method == 'GET':
+            # Получаем все автосообщения
+            messages = AutoBroadcastMessage.query.all()
+            result = {}
+            for msg in messages:
+                result[msg.message_type] = {
+                    'id': msg.id,
+                    'message_type': msg.message_type,
+                    'message_text': msg.message_text,
+                    'enabled': msg.enabled,
+                    'bot_type': msg.bot_type,
+                    'button_text': msg.button_text,
+                    'button_url': msg.button_url,
+                    'button_action': msg.button_action,
+                    'created_at': msg.created_at.isoformat() if msg.created_at else None,
+                    'updated_at': msg.updated_at.isoformat() if msg.updated_at else None
+                }
+            return jsonify(result), 200
+        
+        elif request.method == 'POST':
+            # Обновляем или создаем автосообщения
+            data = request.json
+            messages_data = data.get('messages', {})
+            
+            # Список всех возможных типов сообщений
+            message_types = [
+                'subscription_expiring_3days',
+                'trial_expiring',
+                'no_subscription',
+                'trial_not_used',
+                'trial_active'
+            ]
+            
+            for msg_type in message_types:
+                msg_data = messages_data.get(msg_type)
+                if not msg_data:
+                    continue
+                
+                # Ищем существующее сообщение
+                existing_msg = AutoBroadcastMessage.query.filter_by(message_type=msg_type).first()
+                
+                if existing_msg:
+                    # Обновляем существующее
+                    if 'message_text' in msg_data:
+                        existing_msg.message_text = msg_data['message_text']
+                    if 'enabled' in msg_data:
+                        existing_msg.enabled = bool(msg_data['enabled'])
+                    if 'bot_type' in msg_data:
+                        existing_msg.bot_type = msg_data['bot_type']
+                    # Обновляем кнопку
+                    if 'button_text' in msg_data:
+                        existing_msg.button_text = msg_data['button_text'] or None
+                    if 'button_url' in msg_data:
+                        existing_msg.button_url = msg_data['button_url'] or None
+                    if 'button_action' in msg_data:
+                        existing_msg.button_action = msg_data['button_action'] or None
+                else:
+                    # Создаем новое
+                    default_texts = {
+                        'subscription_expiring_3days': 'Подписка заканчивается через 3 дня, не забудьте продлить',
+                        'trial_expiring': 'Тестовый период заканчивается, не желаете купить подписку?',
+                        'no_subscription': '🔔 Вы ещё не оформили VPN? Не теряйте время — подключитесь сейчас и защитите свой трафик!',
+                        'trial_not_used': '🚀 Бесплатная пробная подписка ждёт вас!\n\nМы заметили, что вы ещё не воспользовались пробным доступом. Активируйте его прямо сейчас и оцените все преимущества VPN! 🔥',
+                        'trial_active': '🎉 Ваш пробный доступ ещё активен!\n\nНе упустите возможность протестировать VPN бесплатно! Никаких обязательств — просто подключитесь и наслаждайтесь безопасным интернетом. 🌍'
+                    }
+                    
+                    new_msg = AutoBroadcastMessage(
+                        message_type=msg_type,
+                        message_text=msg_data.get('message_text', default_texts.get(msg_type, '')),
+                        enabled=msg_data.get('enabled', True),
+                        bot_type=msg_data.get('bot_type', 'both'),
+                        button_text=msg_data.get('button_text') or None,
+                        button_url=msg_data.get('button_url') or None,
+                        button_action=msg_data.get('button_action') or None
+                    )
+                    db.session.add(new_msg)
+            
+            db.session.commit()
+            
+            # Возвращаем обновленные сообщения
+            messages = AutoBroadcastMessage.query.all()
+            result = {}
+            for msg in messages:
+                result[msg.message_type] = {
+                    'id': msg.id,
+                    'message_type': msg.message_type,
+                    'message_text': msg.message_text,
+                    'enabled': msg.enabled,
+                    'bot_type': msg.bot_type,
+                    'button_text': msg.button_text,
+                    'button_url': msg.button_url,
+                    'button_action': msg.button_action,
+                    'created_at': msg.created_at.isoformat() if msg.created_at else None,
+                    'updated_at': msg.updated_at.isoformat() if msg.updated_at else None
+                }
+            
+            return jsonify(result), 200
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Error: {str(e)}"}), 500
+
+
+@app.route('/api/admin/auto-broadcast-settings', methods=['GET', 'POST'])
+@admin_required
+def auto_broadcast_settings_endpoint(current_admin):
+    """Управление настройками планировщика автоматической рассылки"""
+    try:
+        # Получаем или создаем настройки
+        settings = AutoBroadcastSettings.query.first()
+        if not settings:
+            settings = AutoBroadcastSettings(
+                enabled=True,
+                hours='9,14,19'
+            )
+            db.session.add(settings)
+            db.session.commit()
+        
+        if request.method == 'GET':
+            return jsonify({
+                'enabled': settings.enabled,
+                'hours': settings.hours,
+                'updated_at': settings.updated_at.isoformat() if settings.updated_at else None
+            }), 200
+        
+        elif request.method == 'POST':
+            data = request.json
+            
+            if 'enabled' in data:
+                settings.enabled = bool(data['enabled'])
+            if 'hours' in data:
+                # Валидация часов
+                hours_str = data['hours'].strip()
+                try:
+                    hours = [int(h.strip()) for h in hours_str.split(',')]
+                    # Проверяем, что все часы в диапазоне 0-23
+                    for h in hours:
+                        if h < 0 or h > 23:
+                            return jsonify({"message": f"Час {h} вне диапазона 0-23"}), 400
+                    settings.hours = hours_str
+                except ValueError:
+                    return jsonify({"message": "Неверный формат часов. Используйте числа через запятую, например: 9,14,19"}), 400
+            
+            db.session.commit()
+            
+            # Перезапускаем планировщик с новыми настройками
+            try:
+                from app import restart_scheduler
+                restart_scheduler()
+            except Exception as e:
+                print(f"Warning: Could not restart scheduler: {e}")
+            
+            return jsonify({
+                'message': 'Настройки сохранены',
+                'enabled': settings.enabled,
+                'hours': settings.hours,
+                'updated_at': settings.updated_at.isoformat() if settings.updated_at else None
+            }), 200
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Error: {str(e)}"}), 500
 
 
 # ============================================================================

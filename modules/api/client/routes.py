@@ -100,6 +100,110 @@ def get_remnawave_headers(additional_headers=None):
     return headers, cookies
 
 
+def _get_public_base_url_from_request() -> str:
+    """
+    Определить публичный base URL для callback/redirect.
+    Приоритет: env -> X-Forwarded-* -> Host.
+    """
+    base = (os.getenv("YOUR_SERVER_IP_OR_DOMAIN") or os.getenv("YOUR_SERVER_IP") or "").strip()
+    if not base:
+        proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+        host = (request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or request.host or "").split(",")[0].strip()
+        if host:
+            base = f"{proto}://{host}"
+
+    base = base.rstrip("/")
+    if base and not base.startswith(("http://", "https://")):
+        base = f"https://{base}"
+    return base.rstrip("/")
+
+
+def _try_reconcile_payment_if_needed(payment: Payment, user: User) -> bool:
+    """
+    Попытаться обработать платеж без webhook (полезно если callback_url был неверный).
+    Поддержка: platega/platega_mir + crystalpay.
+    Возвращает True если платеж был обработан (стал PAID / подписка обновлена).
+    """
+    try:
+        if not payment or payment.status == 'PAID':
+            return False
+        if not payment.payment_system_id:
+            return False
+
+        s = PaymentSetting.query.first()
+
+        # CrystalPay: invoice/info (state == payed)
+        if payment.payment_provider == 'crystalpay':
+            crystalpay_key = decrypt_key(getattr(s, 'crystalpay_api_key', None)) if s else None
+            crystalpay_secret = decrypt_key(getattr(s, 'crystalpay_api_secret', None)) if s else None
+            if not crystalpay_key or not crystalpay_secret:
+                return False
+            resp = requests.post(
+                "https://api.crystalpay.io/v3/invoice/info/",
+                json={"auth_login": crystalpay_key, "auth_secret": crystalpay_secret, "id": str(payment.payment_system_id)},
+                timeout=10
+            )
+            if not resp.ok:
+                return False
+            data = resp.json() or {}
+            if data.get("error") is True or data.get("errors"):
+                return False
+            state = (data.get("state") or "").lower()
+            if state != "payed":
+                return False
+
+        # Platega / MIR: transaction/{id} (status == CONFIRMED)
+        elif payment.payment_provider in ('platega', 'platega_mir'):
+            platega_key = decrypt_key(getattr(s, 'platega_api_key', None)) if s else None
+            platega_merchant_raw = decrypt_key(getattr(s, 'platega_merchant_id', None)) if s else None
+            if not platega_key or not platega_merchant_raw:
+                return False
+
+            platega_merchant = str(platega_merchant_raw).strip()
+            if platega_merchant.startswith('live_'):
+                platega_merchant = platega_merchant[5:]
+            import re
+            uuid_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+            uuid_match = re.search(uuid_pattern, platega_merchant)
+            if uuid_match:
+                platega_merchant = uuid_match.group(0)
+
+            resp = requests.get(
+                f"https://app.platega.io/transaction/{payment.payment_system_id}",
+                headers={"X-MerchantId": platega_merchant, "X-Secret": platega_key, "Content-Type": "application/json"},
+                timeout=10
+            )
+            if resp.status_code != 200:
+                return False
+            api_data = resp.json() or {}
+            status_upper = (api_data.get('status') or '').upper()
+            if status_upper not in ('CONFIRMED', 'PAID', 'SUCCESS', 'COMPLETED'):
+                return False
+        else:
+            return False
+
+        # Подтверждено: применяем эффект платежа
+        if payment.tariff_id is None:
+            amount_usd = convert_to_usd(payment.amount, payment.currency)
+            user.balance = (float(user.balance) if user.balance else 0.0) + float(amount_usd)
+            payment.status = 'PAID'
+            db.session.commit()
+            try:
+                from modules.notifications import send_user_payment_notification_async
+                send_user_payment_notification_async(user, is_successful=True, is_balance_topup=True, payment=payment)
+            except Exception:
+                pass
+            return True
+
+        t = db.session.get(Tariff, payment.tariff_id)
+        if not t:
+            return False
+        from modules.api.webhooks.routes import process_successful_payment
+        return bool(process_successful_payment(payment, user, t))
+    except Exception:
+        return False
+
+
 def get_referral_settings():
     return ReferralSetting.query.first()
 
@@ -138,7 +242,8 @@ def get_client_referrals_info():
         ref_settings = get_referral_settings()
         referral_type = getattr(ref_settings, 'referral_type', 'DAYS') if ref_settings else 'DAYS'
         default_referral_percent = getattr(ref_settings, 'default_referral_percent', 10.0) if ref_settings else 10.0
-        user_referral_percent = user.referral_percent if user.referral_percent else default_referral_percent
+        # Если у пользователя установлен индивидуальный процент - используем его, иначе глобальный
+        user_referral_percent = user.referral_percent if user.referral_percent is not None else default_referral_percent
         
         # Информация в зависимости от типа системы
         referral_info = {}
@@ -209,7 +314,38 @@ def get_client_me():
             "blocked_at": user.blocked_at.isoformat() if hasattr(user, 'blocked_at') and user.blocked_at else None
         }), 403
 
+    # В режиме multi-config у пользователя может быть несколько RemnaWave-аккаунтов.
+    # Для бота/сайта по умолчанию работаем СТРОГО с основным конфигом (is_primary=True),
+    # иначе легко получить рассинхрон: оплата обновила один UUID, а UI смотрит другой.
     current_uuid = user.remnawave_uuid
+    try:
+        from modules.models.user_config import UserConfig
+
+        primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+        if not primary_config and user.remnawave_uuid and '@' not in user.remnawave_uuid:
+            # Создаем основной конфиг для обратной совместимости
+            primary_config = UserConfig(
+                user_id=user.id,
+                remnawave_uuid=user.remnawave_uuid,
+                config_name='Основной конфиг',
+                is_primary=True
+            )
+            db.session.add(primary_config)
+            db.session.commit()
+
+        if primary_config and primary_config.remnawave_uuid:
+            current_uuid = primary_config.remnawave_uuid
+            # Фиксируем user.remnawave_uuid в сторону primary, чтобы старый бот/сайт не "смотрели" на доп. конфиг.
+            if user.remnawave_uuid != primary_config.remnawave_uuid:
+                old_uuid = user.remnawave_uuid
+                user.remnawave_uuid = primary_config.remnawave_uuid
+                db.session.commit()
+                if old_uuid:
+                    cache.delete(f'live_data_{old_uuid}')
+                    cache.delete(f'nodes_{old_uuid}')
+    except Exception as e:
+        # Не ломаем /api/client/me если таблица user_config еще не создана/миграции не прогнаны
+        print(f"[client/me] Warning: failed to resolve primary config: {e}")
     
     # Проверка на короткий UUID
     is_short_uuid = (not current_uuid or '-' not in current_uuid or len(current_uuid) < 36)
@@ -241,6 +377,25 @@ def get_client_me():
     cache_key = f'live_data_{current_uuid}'
     force_refresh = request.args.get('force_refresh', 'false').lower() == 'true'
 
+    # Если есть свежий PENDING-платеж — пытаемся обработать его и принудительно обновляем данные,
+    # чтобы бот/сайт не "зависали" на оплате.
+    try:
+        recent_pending = Payment.query.filter_by(user_id=user.id).filter(Payment.status != 'PAID').order_by(Payment.created_at.desc()).first()
+        if recent_pending and recent_pending.created_at:
+            now_utc = datetime.now(timezone.utc)
+            pending_dt = recent_pending.created_at
+            if pending_dt.tzinfo is None:
+                pending_dt = pending_dt.replace(tzinfo=timezone.utc)
+            if pending_dt > (now_utc - timedelta(hours=6)):
+                if _try_reconcile_payment_if_needed(recent_pending, user):
+                    # После успешной обработки — обновим live_data из RemnaWave
+                    force_refresh = True
+                else:
+                    # Даже если не удалось — не отдаём 5-минутный кеш сразу после оплаты
+                    force_refresh = True
+    except Exception:
+        pass
+
     if not force_refresh:
         cached = cache.get(cache_key)
         if cached:
@@ -255,7 +410,8 @@ def get_client_me():
                     'telegram_id': user.telegram_id,
                     'telegram_username': user.telegram_username,
                     'balance_usd': balance_usd,
-                    'balance': balance_converted
+                    'balance': balance_converted,
+                    'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
                 })
             return jsonify({"response": cached}), 200
 
@@ -287,7 +443,8 @@ def get_client_me():
                             'telegram_id': user.telegram_id,
                             'telegram_username': user.telegram_username,
                             'balance_usd': balance_usd,
-                            'balance': convert_from_usd(balance_usd, user.preferred_currency)
+                            'balance': convert_from_usd(balance_usd, user.preferred_currency),
+                            'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
                         })
                     return jsonify({"response": cached}), 200
                 
@@ -307,6 +464,7 @@ def get_client_me():
                     'password_hash': user.password_hash if user.password_hash else '',  # Добавляем password_hash
                     'balance_usd': balance_usd,
                     'balance': balance_converted,
+                    'trial_used': getattr(user, 'trial_used', False),  # Добавляем информацию об использовании триала
                     'subscription': None,  # Нет подписки, т.к. пользователь не найден в RemnaWave
                     'warning': 'Пользователь не найден в RemnaWave API. Обратитесь к администратору.'
                 }
@@ -328,7 +486,8 @@ def get_client_me():
                 'telegram_username': user.telegram_username,
                 'password_hash': user.password_hash if user.password_hash else '',  # Добавляем password_hash
                 'balance_usd': balance_usd,
-                'balance': balance_converted
+                'balance': balance_converted,
+                'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
             })
 
         cache.set(cache_key, data, timeout=300)
@@ -348,7 +507,8 @@ def get_client_me():
                     'telegram_username': user.telegram_username,
                     'password_hash': user.password_hash if user.password_hash else '',  # Добавляем password_hash
                     'balance_usd': balance_usd,
-                    'balance': convert_from_usd(balance_usd, user.preferred_currency)
+                    'balance': convert_from_usd(balance_usd, user.preferred_currency),
+                    'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
                 })
             return jsonify({"response": cached}), 200
         return jsonify({"message": f"Ошибка подключения: {str(e)}"}), 500
@@ -360,31 +520,191 @@ def get_client_me():
         return jsonify({"message": "Internal Error"}), 500
 
 
+@app.route('/api/client/configs', methods=['GET'])
+def get_client_configs():
+    """Получить список конфигов пользователя (primary + дополнительные)"""
+    user = get_user_from_token()
+    if not user:
+        return jsonify({"message": "Auth Error"}), 401
+
+    try:
+        from modules.models.user_config import UserConfig
+
+        # Гарантируем наличие primary конфига (обратная совместимость)
+        primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+        if not primary_config and user.remnawave_uuid and '@' not in user.remnawave_uuid:
+            primary_config = UserConfig(
+                user_id=user.id,
+                remnawave_uuid=user.remnawave_uuid,
+                config_name='Основной конфиг',
+                is_primary=True
+            )
+            db.session.add(primary_config)
+            db.session.commit()
+
+        force_refresh = request.args.get('force_refresh', 'false').lower() == 'true'
+
+        configs = UserConfig.query.filter_by(user_id=user.id).order_by(
+            UserConfig.is_primary.desc(),
+            UserConfig.created_at.asc()
+        ).all()
+
+        API_URL = os.getenv('API_URL')
+        headers, cookies = get_remnawave_headers()
+
+        out = []
+        for cfg in configs:
+            cache_key = f'live_data_{cfg.remnawave_uuid}'
+            data = None if force_refresh else cache.get(cache_key)
+            if not isinstance(data, dict):
+                data = None
+
+            if not data and API_URL:
+                try:
+                    resp = requests.get(
+                        f"{API_URL}/api/users/{cfg.remnawave_uuid}",
+                        headers=headers,
+                        cookies=cookies,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        payload = resp.json() or {}
+                        data = payload.get('response', payload) if isinstance(payload, dict) else None
+                        if isinstance(data, dict):
+                            cache.set(cache_key, data, timeout=300)
+                except Exception:
+                    data = None
+
+            subscription_url = data.get('subscriptionUrl') if isinstance(data, dict) else None
+            expire_at = data.get('expireAt') if isinstance(data, dict) else None
+
+            is_active = False
+            if expire_at and isinstance(expire_at, str):
+                try:
+                    exp_dt = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                    is_active = exp_dt > datetime.now(timezone.utc)
+                except Exception:
+                    is_active = False
+
+            out.append({
+                "id": cfg.id,
+                "config_name": cfg.config_name or ("Основной конфиг" if cfg.is_primary else f"Конфиг {cfg.id}"),
+                "is_primary": bool(cfg.is_primary),
+                "subscription_url": subscription_url,
+                "expire_at": expire_at,
+                "is_active": bool(is_active)
+            })
+
+        return jsonify({"configs": out}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal Error"}), 500
+
+
 @app.route('/api/client/activate-trial', methods=['POST'])
 def activate_trial():
     """Активация триала"""
+    from modules.models.trial import get_trial_settings
+    
     user = get_user_from_token()
     if not user:
         return jsonify({"message": "Ошибка аутентификации"}), 401
     
     try:
-        new_exp = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        # Проверяем, использовал ли пользователь уже триал
+        # Проверяем напрямую в БД, так как hasattr может не работать правильно
+        db.session.refresh(user)
+        if hasattr(user, 'trial_used') and user.trial_used:
+            return jsonify({"message": "Trial already used"}), 400
+        
+        # Получаем настройки триала из БД
+        trial_settings = get_trial_settings()
+        
+        if not trial_settings.enabled:
+            return jsonify({"message": "Trial is currently disabled"}), 400
+        
+        # Определяем, на какой конфиг активировать триал - только на основной!
+        from modules.models.user_config import UserConfig
+        primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+        
+        # Если нет основного конфига, но есть remnawave_uuid - создаем его
+        if not primary_config:
+            if user.remnawave_uuid and '@' not in user.remnawave_uuid:
+                primary_config = UserConfig(
+                    user_id=user.id,
+                    remnawave_uuid=user.remnawave_uuid,
+                    config_name='Основной конфиг',
+                    is_primary=True
+                )
+                db.session.add(primary_config)
+                db.session.flush()
+            else:
+                return jsonify({"message": "Primary config not found. Please register first."}), 400
+        
+        # Используем remnawave_uuid из основного конфига
+        remnawave_uuid = primary_config.remnawave_uuid
+        
+        # Используем настройки из БД
+        trial_days = trial_settings.days
+        trial_devices = trial_settings.devices
+        
+        new_exp = (datetime.now(timezone.utc) + timedelta(days=trial_days)).isoformat()
 
         referral_settings = get_referral_settings()
         trial_squad_id = os.getenv("DEFAULT_SQUAD_ID")
         if referral_settings and referral_settings.trial_squad_id:
             trial_squad_id = referral_settings.trial_squad_id
 
+        # Формируем payload для обновления пользователя (только основной конфиг!)
+        patch_payload = {
+            "uuid": remnawave_uuid,
+            "expireAt": new_exp,
+            "activeInternalSquads": [trial_squad_id],
+            "hwidDeviceLimit": trial_devices
+        }
+        
+        # Если установлен лимит трафика, добавляем его
+        if trial_settings.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = trial_settings.traffic_limit_bytes
+
         headers, cookies = get_remnawave_headers()
-        requests.patch(f"{os.getenv('API_URL')}/api/users", headers=headers, cookies=cookies,
-                    json={"uuid": user.remnawave_uuid, "expireAt": new_exp, "activeInternalSquads": [trial_squad_id]})
+        resp = requests.patch(f"{os.getenv('API_URL')}/api/users", headers=headers, cookies=cookies,
+                    json=patch_payload)
         
-        cache.delete(f'live_data_{user.remnawave_uuid}')
+        if resp.status_code != 200:
+            return jsonify({"message": "Failed to activate trial"}), 500
+        
+        # Отмечаем, что пользователь использовал триал (обновляем в БД)
+        user.trial_used = True
+        db.session.commit()
+        
+        # Очищаем кэш для основного конфига
+        cache.delete(f'live_data_{remnawave_uuid}')
         cache.delete('all_live_users_map')
-        cache.delete(f'nodes_{user.remnawave_uuid}')
+        cache.delete(f'nodes_{remnawave_uuid}')
         
-        return jsonify({"message": "Trial activated"}), 200
+        # Очищаем кэш для основного конфига пользователя (если отличается)
+        if remnawave_uuid != user.remnawave_uuid:
+            cache.delete(f'live_data_{user.remnawave_uuid}')
+            cache.delete(f'nodes_{user.remnawave_uuid}')
+        
+        # Форматируем сообщение об успешной активации
+        lang = user.preferred_lang or 'ru'
+        activation_message = getattr(trial_settings, f'activation_message_{lang}', None)
+        if not activation_message:
+            activation_message = trial_settings.activation_message_ru or f"Trial activated! +{trial_days} days"
+        
+        # Заменяем {days} на актуальное значение
+        message = activation_message.replace("{days}", str(trial_days))
+        
+        return jsonify({"message": message}), 200
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"message": "Internal Error"}), 500
 
 
@@ -628,15 +948,22 @@ def activate_promocode():
     try:
         data = request.json
         promo_code = data.get('promo_code', '').strip().upper()
+        
+        print(f"[PROMO] Activate promocode request: code={promo_code}, user_id={user.id}")
 
         if not promo_code:
+            print(f"[PROMO] Error: promo code is required")
             return jsonify({"message": "Promo code is required"}), 400
 
         promo = PromoCode.query.filter_by(code=promo_code).first()
         if not promo:
+            print(f"[PROMO] Error: promo code '{promo_code}' not found")
             return jsonify({"message": "Invalid promo code"}), 404
 
+        print(f"[PROMO] Found promo: type={promo.promo_type}, value={promo.value}, uses_left={promo.uses_left}")
+
         if promo.uses_left <= 0:
+            print(f"[PROMO] Error: promo code '{promo_code}' has no uses left")
             return jsonify({"message": "Promo code is no longer valid"}), 400
 
         if promo.promo_type == 'DAYS':
@@ -666,12 +993,18 @@ def activate_promocode():
                         "message": f"Promo activated! +{promo.value} days",
                         "new_expire_date": new_expire_dt.isoformat()
                     }), 200
+                print(f"[PROMO] Error: Failed to update subscription, resp={update_resp.status_code}")
                 return jsonify({"message": "Failed to update subscription"}), 500
+            print(f"[PROMO] Error: Failed to get user data, resp={resp.status_code}")
             return jsonify({"message": "Failed to get user data"}), 500
         else:
+            print(f"[PROMO] Error: Promo code type '{promo.promo_type}' cannot be activated directly")
             return jsonify({"message": "This promo code type cannot be activated directly"}), 400
 
     except Exception as e:
+        print(f"[PROMO] Exception: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"message": "Internal Error"}), 500
 
 
@@ -702,6 +1035,8 @@ def purchase_with_balance():
     try:
         data = request.json
         tariff_id = data.get('tariff_id')
+        config_id = data.get('config_id')  # ID конфига для оплаты
+        create_new_config = data.get('create_new_config', False)  # Флаг создания нового конфига
         promo_code_str = data.get('promo_code', '').strip().upper() if data.get('promo_code') else None
         
         if not tariff_id:
@@ -752,58 +1087,22 @@ def purchase_with_balance():
                 "message": f"Недостаточно средств на балансе. Требуется: {final_amount:.2f} {info['c']}, доступно: {current_balance_display:.2f} {info['c']}"
             }), 400
         
+        # Определяем конфиг для оплаты
+        user_config = None
+        if config_id:
+            from modules.models.user_config import UserConfig
+            user_config = UserConfig.query.filter_by(id=config_id, user_id=user.id).first()
+            if not user_config:
+                return jsonify({"message": "Config not found"}), 404
+        elif not create_new_config:
+            # Если не указан config_id и не нужно создавать новый конфиг, используем основной
+            from modules.models.user_config import UserConfig
+            primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+            if primary_config:
+                user_config = primary_config
+        
         # Списываем средства с баланса
         user.balance = current_balance_usd - final_amount_usd
-        
-        # Активируем тариф
-        API_URL = os.getenv('API_URL')
-        DEFAULT_SQUAD_ID = os.getenv('DEFAULT_SQUAD_ID')
-        h, c = get_remnawave_headers()
-        live = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers=h, cookies=c, timeout=10).json().get('response', {})
-        curr_exp = parse_iso_datetime(live.get('expireAt'))
-        if not curr_exp:
-            curr_exp = datetime.now(timezone.utc)
-        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
-        
-        # Получаем список сквадов из тарифа
-        squad_ids = []
-        if hasattr(t, 'get_squad_ids'):
-            squad_ids = t.get_squad_ids()
-        elif hasattr(t, 'squad_ids') and t.squad_ids:
-            try:
-                import json
-                squad_ids = json.loads(t.squad_ids) if isinstance(t.squad_ids, str) else t.squad_ids
-            except:
-                squad_ids = []
-        
-        # Если сквады не указаны, используем дефолтный
-        if not squad_ids:
-            if t.squad_id:
-                squad_ids = [t.squad_id]
-            else:
-                squad_ids = [DEFAULT_SQUAD_ID] if DEFAULT_SQUAD_ID else []
-        
-        patch_payload = {
-            "uuid": user.remnawave_uuid,
-            "expireAt": new_exp.isoformat(),
-            "activeInternalSquads": squad_ids
-        }
-        
-        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
-            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
-            patch_payload["trafficLimitStrategy"] = "NO_RESET"
-        
-        h, c = get_remnawave_headers({"Content-Type": "application/json"})
-        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload, timeout=10)
-        if not patch_resp.ok:
-            user.balance = current_balance_usd
-            db.session.rollback()
-            return jsonify({"message": "Ошибка активации тарифа"}), 500
-        
-        # Списываем использование промокода
-        if promo_code_obj:
-            if promo_code_obj.uses_left > 0:
-                promo_code_obj.uses_left -= 1
         
         # Создаем запись о платеже
         order_id = f"u{user.id}-t{t.id}-balance-{int(datetime.now().timestamp())}"
@@ -811,28 +1110,77 @@ def purchase_with_balance():
             order_id=order_id,
             user_id=user.id,
             tariff_id=t.id,
-            status='PAID',
+            status='PENDING',  # Сначала PENDING, потом станет PAID после успешной активации
             amount=final_amount,
             currency=info['c'],
-            promo_code_id=promo_code_obj.id if promo_code_obj else None
+            payment_provider='balance',
+            promo_code_id=promo_code_obj.id if promo_code_obj else None,
+            user_config_id=user_config.id if user_config else None,
+            create_new_config=create_new_config
         )
         db.session.add(new_p)
+        db.session.flush()
+        
+        # Используем process_successful_payment для единообразия логики
+        from modules.api.webhooks.routes import process_successful_payment
+        success = process_successful_payment(new_p, user, t)
+        
+        if not success:
+            # Откатываем списание баланса
+            user.balance = current_balance_usd
+            db.session.rollback()
+            return jsonify({"message": "Ошибка активации тарифа"}), 500
+        
+        # Баланс уже списан выше, process_successful_payment не списывает его повторно
+        # Просто коммитим изменения
         db.session.commit()
         
-        # Начисляем реферальную комиссию
-        from modules.api.webhooks.routes import add_referral_commission
-        add_referral_commission(user, final_amount_usd, is_tariff_purchase=True)
-        db.session.commit()
+        # Получаем актуальную дату истечения после активации
+        API_URL = os.getenv('API_URL')
+        h, c = get_remnawave_headers()
         
+        # Определяем remnawave_uuid для получения новой даты
+        remnawave_uuid_to_check = user.remnawave_uuid
+        if user_config:
+            remnawave_uuid_to_check = user_config.remnawave_uuid
+        elif create_new_config:
+            # Если создали новый конфиг, получаем его UUID
+            from modules.models.user_config import UserConfig
+            new_config = UserConfig.query.filter_by(user_id=user.id).order_by(UserConfig.created_at.desc()).first()
+            if new_config:
+                remnawave_uuid_to_check = new_config.remnawave_uuid
+        
+        # Получаем актуальную дату истечения
+        new_expire_date = None
+        try:
+            resp = requests.get(f"{API_URL}/api/users/{remnawave_uuid_to_check}", headers=h, cookies=c, timeout=10)
+            if resp.status_code == 200:
+                live_data = resp.json().get('response', {})
+                new_expire_date = live_data.get('expireAt')
+        except:
+            pass
+        
+        # Очищаем кэш
         cache.delete(f'live_data_{user.remnawave_uuid}')
         cache.delete(f'nodes_{user.remnawave_uuid}')
         cache.delete('all_live_users_map')
         
-        return jsonify({
+        # Если создали новый конфиг, очищаем кэш для него тоже
+        if create_new_config:
+            from modules.models.user_config import UserConfig
+            new_config = UserConfig.query.filter_by(user_id=user.id).order_by(UserConfig.created_at.desc()).first()
+            if new_config:
+                cache.delete(f'live_data_{new_config.remnawave_uuid}')
+                cache.delete(f'nodes_{new_config.remnawave_uuid}')
+        
+        response_data = {
             "message": "Тариф успешно активирован",
-            "order_id": order_id,
-            "new_expire_date": new_exp.isoformat()
-        }), 200
+            "order_id": order_id
+        }
+        if new_expire_date:
+            response_data["new_expire_date"] = new_expire_date
+        
+        return jsonify(response_data), 200
         
     except Exception as e:
         db.session.rollback()
@@ -853,6 +1201,9 @@ def create_payment():
         return jsonify({"message": "Auth Error"}), 401
     
     try:
+        request_source = (request.json.get('source') if request.json else None) or (request.json.get('payment_source') if request.json else None) or 'website'
+        request_source = str(request_source).lower().strip()
+
         payment_type = request.json.get('type', 'tariff')
         tid = request.json.get('tariff_id')
         
@@ -871,9 +1222,15 @@ def create_payment():
             payment_url = None
             payment_system_id = None
             
-            YOUR_SERVER_IP_OR_DOMAIN = os.getenv("YOUR_SERVER_IP", "https://panel.stealthnet.app")
-            if not YOUR_SERVER_IP_OR_DOMAIN.startswith(('http://', 'https://')):
-                YOUR_SERVER_IP_OR_DOMAIN = f"https://{YOUR_SERVER_IP_OR_DOMAIN}"
+            YOUR_SERVER_IP_OR_DOMAIN = _get_public_base_url_from_request()
+
+            # Для бота/мини-аппа после оплаты ведем на payment-success (который редиректит в Telegram)
+            if request_source in ('bot', 'miniapp', 'telegram'):
+                from modules.api.payments.base import get_bot_username
+                bot_username = get_bot_username() or 'stealthnet_test_bot'
+                redirect_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/payment-success.html?bot={bot_username}&order_id={order_id}" if YOUR_SERVER_IP_OR_DOMAIN else f"/miniapp/payment-success.html?bot={bot_username}&order_id={order_id}"
+            else:
+                redirect_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "/dashboard/subscription"
             
             currency_code_map = {"uah": "UAH", "rub": "RUB", "usd": "USD"}
             cp_currency = currency_code_map.get(currency.lower(), "UAH")
@@ -883,12 +1240,6 @@ def create_payment():
                 crystalpay_secret = decrypt_key(s.crystalpay_api_secret) if s else None
                 if not crystalpay_key or crystalpay_key == "DECRYPTION_ERROR" or not crystalpay_secret or crystalpay_secret == "DECRYPTION_ERROR":
                     return jsonify({"message": "CrystalPay не настроен"}), 500
-                
-                # Определяем источник: если есть telegram_id, значит из бота
-                from modules.api.payments.base import get_return_url
-                source = 'miniapp' if user.telegram_id else 'website'
-                miniapp_type = 'v1' if user.telegram_id else 'v2'  # Старый бот использует v1
-                redirect_url = get_return_url(source=source, miniapp_type=miniapp_type)
                 
                 payload = {
                     "auth_login": crystalpay_key,
@@ -926,12 +1277,6 @@ def create_payment():
                 else:
                     heleket_currency = "USD"
                     to_currency = "USDT"
-                
-                # Определяем источник: если есть telegram_id, значит из бота
-                from modules.api.payments.base import get_return_url
-                source = 'miniapp' if user.telegram_id else 'website'
-                miniapp_type = 'v1' if user.telegram_id else 'v2'  # Старый бот использует v1
-                redirect_url = get_return_url(source=source, miniapp_type=miniapp_type)
                 
                 payload = {
                     "amount": f"{float(amount):.2f}",
@@ -981,6 +1326,25 @@ def create_payment():
                 if not payment_url:
                     error_msg = payment_system_id or "Failed to create YooKassa payment"
                     print(f"YooKassa Error: {error_msg}")
+                    return jsonify({"message": error_msg}), 500
+
+            elif payment_provider == 'yoomoney':
+                if cp_currency != 'RUB':
+                    return jsonify({"message": "YooMoney поддерживает только валюту RUB. Пожалуйста, выберите другую платежную систему или измените валюту на RUB."}), 400
+
+                from modules.api.payments import create_payment as create_payment_provider
+                payment_url, payment_system_id = create_payment_provider(
+                    provider='yoomoney',
+                    amount=float(amount),
+                    currency='RUB',
+                    order_id=order_id,
+                    description=f"Пополнение баланса StealthNET #{order_id}",
+                    source='website'
+                )
+
+                if not payment_url:
+                    error_msg = payment_system_id or "Failed to create YooMoney payment"
+                    print(f"YooMoney Error: {error_msg}")
                     return jsonify({"message": error_msg}), 500
             
             elif payment_provider == 'telegram_stars':
@@ -1060,7 +1424,7 @@ def create_payment():
                 payment_url = f"https://auth.robokassa.ru/Merchant/Index.aspx?MerchantLogin={robokassa_login}&OutSum={float(amount)}&InvId={order_id}&SignatureValue={signature}&Description=Пополнение баланса&Culture=ru&IsTest=0"
                 payment_system_id = order_id
             
-            elif payment_provider == 'platega':
+            elif payment_provider in ('platega', 'platega_mir'):
                 import uuid
                 import re
                 platega_key = decrypt_key(getattr(s, 'platega_api_key', None)) if s else None
@@ -1068,6 +1432,9 @@ def create_payment():
                 if not platega_key or not platega_merchant_raw or platega_key == "DECRYPTION_ERROR" or platega_merchant_raw == "DECRYPTION_ERROR":
                     print(f"Platega credentials error: key={bool(platega_key)}, merchant={bool(platega_merchant_raw)}")
                     return jsonify({"message": "Platega credentials not configured"}), 500
+
+                if payment_provider == 'platega_mir' and not getattr(s, 'platega_mir_enabled', False):
+                    return jsonify({"message": "Platega MIR is disabled"}), 400
                 
                 if (not isinstance(platega_key, str) or not platega_key.strip() or 
                     not isinstance(platega_merchant_raw, str) or not platega_merchant_raw.strip()):
@@ -1102,15 +1469,16 @@ def create_payment():
                 
                 transaction_uuid = str(uuid.uuid4())
                 
+                payment_method = 11 if payment_provider == 'platega_mir' else 2
                 payload = {
-                    "paymentMethod": 2,
+                    "paymentMethod": payment_method,
                     "paymentDetails": {
                         "amount": float(amount),
                         "currency": cp_currency
                     },
                     "description": f"Balance topup {order_id}",
-                    "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/payment-success.html?order_id={order_id}",
-                    "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "return": redirect_url,
+                    "failedUrl": redirect_url,
                     "callbackUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/platega"
                 }
                 
@@ -1253,6 +1621,39 @@ def create_payment():
             
             promo_code_str = request.json.get('promo_code', '').strip().upper() if request.json.get('promo_code') else None
             payment_provider = request.json.get('payment_provider', 'crystalpay')
+            create_new_config = bool(request.json.get('create_new_config') or request.json.get('createNewConfig') or False)
+
+            # Важно: привязываем платеж к конфигу.
+            # По умолчанию (бот/сайт) — основной конфиг (is_primary=True).
+            config_id = request.json.get('config_id') or request.json.get('configId')
+            user_config = None
+            try:
+                from modules.models.user_config import UserConfig
+                if create_new_config:
+                    # Для "нового конфига" не привязываем user_config_id — webhook создаст конфиг после оплаты
+                    user_config = None
+                elif config_id:
+                    try:
+                        config_id_int = int(config_id)
+                    except Exception:
+                        return jsonify({"message": "Invalid config_id"}), 400
+                    user_config = UserConfig.query.filter_by(id=config_id_int, user_id=user.id).first()
+                    if not user_config:
+                        return jsonify({"message": "Config not found"}), 404
+                else:
+                    user_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+                    if not user_config and user.remnawave_uuid and '@' not in user.remnawave_uuid:
+                        user_config = UserConfig(
+                            user_id=user.id,
+                            remnawave_uuid=user.remnawave_uuid,
+                            config_name='Основной конфиг',
+                            is_primary=True
+                        )
+                        db.session.add(user_config)
+                        db.session.flush()
+            except Exception as e:
+                # Если таблицы user_config нет (миграции не прогнаны), продолжаем без привязки
+                print(f"[create-payment] Warning: failed to resolve user_config: {e}")
             
             from modules.models.tariff import Tariff
             t = db.session.get(Tariff, tid)
@@ -1293,9 +1694,14 @@ def create_payment():
             payment_url = None
             payment_system_id = None
             
-            YOUR_SERVER_IP_OR_DOMAIN = os.getenv("YOUR_SERVER_IP", "https://panel.stealthnet.app")
-            if not YOUR_SERVER_IP_OR_DOMAIN.startswith(('http://', 'https://')):
-                YOUR_SERVER_IP_OR_DOMAIN = f"https://{YOUR_SERVER_IP_OR_DOMAIN}"
+            YOUR_SERVER_IP_OR_DOMAIN = _get_public_base_url_from_request()
+
+            if request_source in ('bot', 'miniapp', 'telegram'):
+                from modules.api.payments.base import get_bot_username
+                bot_username = get_bot_username() or 'stealthnet_test_bot'
+                redirect_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/payment-success.html?bot={bot_username}&order_id={order_id}" if YOUR_SERVER_IP_OR_DOMAIN else f"/miniapp/payment-success.html?bot={bot_username}&order_id={order_id}"
+            else:
+                redirect_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "/dashboard/subscription"
             
             # CrystalPay
             if payment_provider == 'crystalpay':
@@ -1303,12 +1709,6 @@ def create_payment():
                 crystalpay_secret = decrypt_key(s.crystalpay_api_secret) if s else None
                 if not crystalpay_key or crystalpay_key == "DECRYPTION_ERROR" or not crystalpay_secret or crystalpay_secret == "DECRYPTION_ERROR":
                     return jsonify({"message": "CrystalPay не настроен"}), 500
-                
-                # Определяем источник: если есть telegram_id, значит из бота
-                from modules.api.payments.base import get_return_url
-                source = 'miniapp' if user.telegram_id else 'website'
-                miniapp_type = 'v1' if user.telegram_id else 'v2'  # Старый бот использует v1
-                redirect_url = get_return_url(source=source, miniapp_type=miniapp_type)
                 
                 payload = {
                     "auth_login": crystalpay_key,
@@ -1352,7 +1752,7 @@ def create_payment():
                     "amount": f"{final_amount:.2f}",
                     "currency": heleket_currency,
                     "order_id": order_id,
-                    "url_return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "url_return": redirect_url,
                     "url_callback": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/heleket"
                 }
                 
@@ -1395,6 +1795,25 @@ def create_payment():
                 
                 if not payment_url:
                     error_msg = payment_system_id or "Failed to create YooKassa payment"
+                    return jsonify({"message": error_msg}), 500
+
+            # YooMoney
+            elif payment_provider == 'yoomoney':
+                if info['c'] != 'RUB':
+                    return jsonify({"message": "YooMoney supports only RUB currency"}), 400
+
+                from modules.api.payments import create_payment as create_payment_provider
+                payment_url, payment_system_id = create_payment_provider(
+                    provider='yoomoney',
+                    amount=final_amount,
+                    currency='RUB',
+                    order_id=order_id,
+                    description=f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                    source='website'
+                )
+
+                if not payment_url:
+                    error_msg = payment_system_id or "Failed to create YooMoney payment"
                     return jsonify({"message": error_msg}), 500
             
             # Telegram Stars
@@ -1536,7 +1955,7 @@ def create_payment():
                         "destination": f"Подписка StealthNET - {t.name}",
                         "comment": f"Подписка на {t.duration_days} дней"
                     },
-                    "redirectUrl": get_return_url(source='miniapp' if user.telegram_id else 'website', miniapp_type='v1' if user.telegram_id else 'v2'),
+                    "redirectUrl": redirect_url,
                     "webHookUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/monobank",
                     "validity": 3600,
                     "paymentType": "debit"
@@ -1555,8 +1974,8 @@ def create_payment():
                 else:
                     print(f"Monobank API Error: {resp.status_code} - {resp.text}")
             
-            # Platega
-            elif payment_provider == 'platega':
+            # Platega / Platega MIR
+            elif payment_provider in ('platega', 'platega_mir'):
                 import uuid
                 import re
                 platega_key = decrypt_key(getattr(s, 'platega_api_key', None)) if s else None
@@ -1564,6 +1983,9 @@ def create_payment():
                 if not platega_key or not platega_merchant_raw or platega_key == "DECRYPTION_ERROR" or platega_merchant_raw == "DECRYPTION_ERROR":
                     print(f"Platega credentials error: key={bool(platega_key)}, merchant={bool(platega_merchant_raw)}")
                     return jsonify({"message": "Platega credentials not configured"}), 500
+
+                if payment_provider == 'platega_mir' and not getattr(s, 'platega_mir_enabled', False):
+                    return jsonify({"message": "Platega MIR is disabled"}), 400
                 
                 # Проверяем, что ключи не пустые после расшифровки
                 if (not isinstance(platega_key, str) or not platega_key.strip() or 
@@ -1601,15 +2023,16 @@ def create_payment():
                 
                 # Согласно документации Platega: ID транзакции генерируется системой автоматически
                 # НЕ передаем поле "id" в запросе
+                payment_method = 11 if payment_provider == 'platega_mir' else 2
                 payload = {
-                    "paymentMethod": 2,
+                    "paymentMethod": payment_method,
                     "paymentDetails": {
                         "amount": float(final_amount),  # Должно быть float, не int
                         "currency": info['c']
                     },
                     "description": f"Payment for order {transaction_uuid}",
-                    "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
-                    "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "return": redirect_url,
+                    "failedUrl": redirect_url,
                     "callbackUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/platega"
                 }
                 
@@ -1887,7 +2310,7 @@ def create_payment():
                 }
                 
                 checkout_options = {
-                    "redirectURL": get_return_url(source='miniapp' if user.telegram_id else 'website', miniapp_type='v1' if user.telegram_id else 'v2')
+                    "redirectURL": get_return_url(source='website')
                 }
                 
                 payload = {
@@ -1979,11 +2402,7 @@ def create_payment():
                 if not crystalpay_key or not crystalpay_secret or crystalpay_key == "DECRYPTION_ERROR" or crystalpay_secret == "DECRYPTION_ERROR":
                     return jsonify({"message": "CrystalPay credentials not configured"}), 500
                 
-                # Определяем источник: если есть telegram_id, значит из бота
-                from modules.api.payments.base import get_return_url
-                source = 'miniapp' if user.telegram_id else 'website'
-                miniapp_type = 'v1' if user.telegram_id else 'v2'  # Старый бот использует v1
-                redirect_url = get_return_url(source=source, miniapp_type=miniapp_type)
+                redirect_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "/dashboard/subscription"
                 
                 payload = {
                     "auth_login": crystalpay_key,
@@ -2021,7 +2440,9 @@ def create_payment():
                 currency=info['c'],
                 payment_system_id=str(payment_system_id) if payment_system_id else order_id,
                 payment_provider=payment_provider,
-                promo_code_id=promo_code_obj.id if promo_code_obj else None
+                promo_code_id=promo_code_obj.id if promo_code_obj else None,
+                user_config_id=user_config.id if user_config else None,
+                create_new_config=create_new_config
             )
             db.session.add(new_p)
             db.session.commit()
@@ -2032,6 +2453,31 @@ def create_payment():
         import traceback
         traceback.print_exc()
         return jsonify({"message": "Internal Error"}), 500
+
+
+@app.route('/api/client/payments/reconcile', methods=['POST'])
+def reconcile_client_payments():
+    """
+    Попытаться обработать "зависшие" оплаты (если webhook не пришёл).
+    Сейчас поддерживается только Platega (и platega_mir), т.к. у него есть API проверки статуса транзакции.
+    """
+    user = get_user_from_token()
+    if not user:
+        return jsonify({"success": False, "message": "Auth Error"}), 401
+
+    try:
+        # Берем самый свежий "не PAID" платеж пользователя (за тариф или пополнение)
+        p = Payment.query.filter_by(user_id=user.id).filter(Payment.status != 'PAID').order_by(Payment.created_at.desc()).first()
+        if not p:
+            return jsonify({"success": True, "message": "No pending payments"}), 200
+
+        ok = _try_reconcile_payment_if_needed(p, user)
+        return jsonify({"success": bool(ok), "message": "Processed" if ok else "Not processed", "provider": p.payment_provider}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "message": "Internal Error"}), 500
 
 
 # ============================================================================

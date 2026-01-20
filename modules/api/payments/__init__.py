@@ -17,19 +17,21 @@
 from modules.api.payments.crystalpay import create_crystalpay_payment
 from modules.api.payments.heleket import create_heleket_payment
 from modules.api.payments.yookassa import create_yookassa_payment
+from modules.api.payments.yoomoney import create_yoomoney_payment
 from modules.api.payments.telegram_stars import create_telegram_stars_payment
 from modules.api.payments.freekassa import create_freekassa_payment
 from modules.api.payments.robokassa import create_robokassa_payment
 from modules.api.payments.cryptobot import create_cryptobot_payment
 from modules.api.payments.monobank import create_monobank_payment
 from modules.api.payments.btcpayserver import create_btcpayserver_payment
-from modules.api.payments.platega import create_platega_payment
+from modules.api.payments.platega import create_platega_payment, create_platega_mir_payment
 
 # Маппинг провайдеров к функциям создания платежа
 PAYMENT_PROVIDERS = {
     'crystalpay': create_crystalpay_payment,
     'heleket': create_heleket_payment,
     'yookassa': create_yookassa_payment,
+    'yoomoney': create_yoomoney_payment,
     'telegram_stars': create_telegram_stars_payment,
     'freekassa': create_freekassa_payment,
     'robokassa': create_robokassa_payment,
@@ -37,6 +39,7 @@ PAYMENT_PROVIDERS = {
     'monobank': create_monobank_payment,
     'btcpayserver': create_btcpayserver_payment,
     'platega': create_platega_payment,
+    'platega_mir': create_platega_mir_payment,
 }
 
 

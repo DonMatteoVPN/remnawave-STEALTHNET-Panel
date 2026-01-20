@@ -17,6 +17,7 @@ def test_webhook_endpoints():
         "/webhook/heleket",
         "/webhook/telegram-stars",
         "/webhook/yookassa",
+        "/webhook/yoomoney",
         "/webhook/crystalpay",
         "/webhook/platega",
         "/webhook/mulenpay",

@@ -33,13 +33,23 @@ def run_all_schema_migrations(app=None):
         ('add_referral_fields.py', 'add_referral_fields'),
         ('add_user_blocking_fields.py', 'add_user_blocking_fields'),  # Раньше, чтобы is_blocked был доступен
         ('add_referral_percent_to_user.py', 'add_referral_percent_to_user'),
+        ('fix_referral_percent_default.py', 'migrate'),
         ('add_branding_fields.py', 'add_branding_fields'),
         ('add_favicon_url_to_branding.py', 'add_favicon_url_to_branding'),  # После add_branding_fields, на случай если favicon_url не был добавлен
         ('add_yookassa_receipt_field.py', 'add_yookassa_receipt_field'),
+        ('add_yoomoney_fields.py', 'add_yoomoney_fields'),
+        ('add_platega_mir_enabled.py', 'migrate'),  # Галочка "Карты МИР" для Platega
         ('add_squad_ids_to_tariff.py', 'add_squad_ids_to_tariff'),
         ('add_squad_id_to_promo_code.py', 'add_squad_id_to_promo_code'),
         ('add_is_admin_to_ticket_message.py', 'add_is_admin_to_ticket_message'),
         ('add_telegram_message_id_to_payment.py', 'add_telegram_message_id_to_payment'),
+        ('add_button_fields_to_auto_broadcast.py', 'add_button_fields_to_auto_broadcast'),  # Поля кнопок для авторассылки
+        ('add_casino_tables.py', 'add_casino_tables'),  # Таблицы казино
+        ('migration/migrate_add_trial_settings.py', 'migrate_add_trial_settings'),  # Настройки триала
+        ('add_trial_used_to_user.py', 'migrate'),  # Поле trial_used в user (должно быть ДО add_user_config_table)
+        ('add_user_config_table.py', 'migrate'),  # Таблица для нескольких конфигов пользователя
+        ('add_user_config_id_to_payment.py', 'migrate'),  # Поле user_config_id в payment
+        ('add_create_new_config_to_payment.py', 'migrate'),  # Поле create_new_config в payment
     ]
     
     success_count = 0
@@ -78,7 +88,13 @@ def run_all_schema_migrations(app=None):
                 module = importlib.util.module_from_spec(spec)
                 
                 # Для скриптов, которые используют app из app.py
-                if script_file == 'add_yookassa_receipt_field.py':
+                # Это нужно для add_yookassa_receipt_field.py и миграций из папки migration/
+                needs_app_substitution = (
+                    script_file == 'add_yookassa_receipt_field.py' or 
+                    'migration/' in script_file
+                )
+                
+                if needs_app_substitution:
                     # Этот скрипт импортирует app из app.py, нужно подменить
                     try:
                         import app as app_module
@@ -92,7 +108,7 @@ def run_all_schema_migrations(app=None):
                 spec.loader.exec_module(module)
                 
                 # Восстанавливаем оригинальный app
-                if script_file == 'add_yookassa_receipt_field.py':
+                if needs_app_substitution:
                     try:
                         import app as app_module
                         if hasattr(app_module, 'app') and 'original_app' in locals():
@@ -105,6 +121,7 @@ def run_all_schema_migrations(app=None):
                 # Пробуем несколько вариантов имени функции
                 script_base_name = script_name.replace('.py', '')
                 possible_func_names = [
+                    'migrate',  # Стандартное имя функции для миграций в папке migration/
                     script_base_name,  # add_branding_fields
                     script_base_name.replace('_', ''),  # addbrandingfields
                     script_base_name.replace('_', '_'),  # add_branding_fields (то же самое)
@@ -121,8 +138,20 @@ def run_all_schema_migrations(app=None):
                     # Передаем app в функцию, если она принимает параметр
                     import inspect
                     sig = inspect.signature(func)
-                    if 'app_instance' in sig.parameters or 'app' in sig.parameters:
-                        func(app)
+                    param_names = list(sig.parameters.keys())
+                    
+                    # Проверяем, принимает ли функция параметры
+                    if len(param_names) > 0:
+                        # Если функция принимает app_instance или app, передаем app
+                        if 'app_instance' in param_names or 'app' in param_names:
+                            func(app)
+                        else:
+                            # Пробуем передать app как первый позиционный аргумент
+                            try:
+                                func(app)
+                            except TypeError:
+                                # Если не принимает app, вызываем без параметров
+                                func()
                     else:
                         func()
                 

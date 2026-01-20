@@ -94,10 +94,15 @@ def create_platega_payment(amount: float, currency: str, order_id: str, **kwargs
         
         # Согласно документации Platega:
         # - ID транзакции генерируется автоматически (не передаём)
-        # - paymentMethod: 2 = card
+        # - paymentMethod: 2 = card, 11 = MIR (по запросу)
         # - amount должен быть float
+        payment_method = kwargs.get('payment_method')
+        try:
+            payment_method = int(payment_method) if payment_method is not None else 2
+        except Exception:
+            payment_method = 2
         payload = {
-            "paymentMethod": 2,
+            "paymentMethod": payment_method,
             "paymentDetails": {
                 "amount": float(amount),
                 "currency": currency
@@ -255,4 +260,11 @@ def verify_platega_signature(data: dict, signature: str) -> bool:
     # На данный момент просто возвращаем True
     # TODO: Добавить проверку подписи согласно документации Platega
     return True
+
+
+def create_platega_mir_payment(amount: float, currency: str, order_id: str, **kwargs):
+    """Платеж Platega через 'Карты МИР' (paymentMethod=11)"""
+    kwargs = dict(kwargs or {})
+    kwargs['payment_method'] = 11
+    return create_platega_payment(amount, currency, order_id, **kwargs)
 

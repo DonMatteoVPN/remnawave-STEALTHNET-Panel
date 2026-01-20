@@ -8,6 +8,9 @@ import os
 import logging
 import requests
 import asyncio
+import base64
+import json
+import time
 from datetime import datetime
 from typing import Optional
 from dotenv import load_dotenv
@@ -53,7 +56,7 @@ LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 _bot_config_cache = {
     'data': None,
     'last_update': 0,
-    'cache_ttl': 10  # 10 секунд — для быстрого обновления при изменении в админке
+    'cache_ttl': 5  # 5 секунд — для быстрого обновления при изменении в админке
 }
 
 def clear_bot_config_cache():
@@ -102,7 +105,11 @@ def get_bot_config() -> dict:
         'translations': {},
         'welcome_messages': {},
         'user_agreements': {},
-        'offer_texts': {}
+        'offer_texts': {},
+        'require_channel_subscription': False,
+        'channel_id': '',
+        'channel_url': '',
+        'channel_subscription_texts': {}
     }
 
 def get_service_name() -> str:
@@ -146,6 +153,87 @@ def get_trial_days() -> int:
     config = get_bot_config()
     return config.get('trial_days', 3)
 
+# Кеш настроек триала
+_trial_settings_cache = {
+    'data': None,
+    'last_update': 0,
+    'cache_ttl': 30  # 30 секунд
+}
+
+def clear_trial_settings_cache():
+    """Очистить кеш настроек триала"""
+    _trial_settings_cache['data'] = None
+    _trial_settings_cache['last_update'] = 0
+
+def get_trial_settings() -> dict:
+    """Получить настройки триала из API с кешированием"""
+    import time
+    
+    current_time = time.time()
+    
+    # Возвращаем из кеша если не истёк
+    if _trial_settings_cache['data'] and (current_time - _trial_settings_cache['last_update']) < _trial_settings_cache['cache_ttl']:
+        return _trial_settings_cache['data']
+    
+    # Загружаем из API
+    try:
+        response = requests.get(f"{FLASK_API_URL}/api/public/trial-settings", timeout=5)
+        if response.status_code == 200:
+            settings = response.json()
+            _trial_settings_cache['data'] = settings
+            _trial_settings_cache['last_update'] = current_time
+            return settings
+    except Exception as e:
+        logger.warning(f"Failed to load trial settings from API: {e}")
+    
+    # Возвращаем кеш даже если истёк
+    if _trial_settings_cache['data']:
+        return _trial_settings_cache['data']
+    
+    # Дефолтные настройки
+    return {
+        'days': 3,
+        'devices': 3,
+        'traffic_limit_bytes': 0,
+        'enabled': True,
+        'button_text_ru': '🎁 Попробовать бесплатно ({days} дня)',
+        'button_text_ua': '🎁 Спробувати безкоштовно ({days} дні)',
+        'button_text_en': '🎁 Try Free ({days} Days)',
+        'button_text_cn': '🎁 免费试用 ({days} 天)'
+    }
+
+def get_trial_button_text(lang: str = 'ru') -> str:
+    """Получить текст кнопки триала для указанного языка"""
+    settings = get_trial_settings()
+    
+    if not settings.get('enabled', True):
+        # Если триал отключен, возвращаем пустую строку (кнопка не должна отображаться)
+        return ''
+    
+    days = settings.get('days', 3)
+    button_text_key = f'button_text_{lang}'
+    button_text = settings.get(button_text_key, '')
+    
+    # Если нет текста для языка, используем русский
+    if not button_text and lang != 'ru':
+        button_text = settings.get('button_text_ru', '')
+    
+    # Заменяем {days} на актуальное значение
+    if button_text:
+        button_text = button_text.replace('{days}', str(days))
+    
+    # Если текст всё ещё пустой, используем дефолтный
+    if not button_text:
+        default_texts = {
+            'ru': f'🎁 Попробовать бесплатно ({days} дня)',
+            'ua': f'🎁 Спробувати безкоштовно ({days} дні)',
+            'en': f'🎁 Try Free ({days} Days)',
+            'cn': f'🎁 免费试用 ({days} 天)'
+        }
+        button_text = default_texts.get(lang, default_texts['ru'])
+    
+    return button_text
+
 def is_channel_subscription_required() -> bool:
     """Проверить, требуется ли подписка на канал"""
     config = get_bot_config()
@@ -176,11 +264,11 @@ def get_channel_subscription_text(lang: str) -> str:
 def get_buttons_order() -> list:
     """Получить порядок кнопок в меню"""
     config = get_bot_config()
-    default_order = ['connect', 'trial', 'status', 'tariffs', 'topup', 'servers', 'referrals', 'support', 'settings', 'agreement', 'offer', 'webapp']
+    default_order = ['connect', 'configs', 'trial', 'status', 'tariffs', 'topup', 'servers', 'referrals', 'support', 'settings', 'agreement', 'offer', 'webapp']
     return config.get('buttons_order', default_order) or default_order
 
 
-def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: str, expire_at) -> list:
+def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: str, expire_at, trial_used: bool = False) -> list:
     """Построить клавиатуру главного меню на основе настроек из админки"""
     from telegram import InlineKeyboardButton, WebAppInfo
     
@@ -198,12 +286,21 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
             'visibility_key': None,  # Всегда показываем если условие выполнено
             'single': True
         },
+        'configs': {
+            'icon': '🧩',
+            'text_key': 'configs_button',
+            'type': 'callback',
+            'callback_data': 'configs',
+            'condition': True,
+            'visibility_key': None,
+            'single': True
+        },
         'trial': {
             'icon': '🎁',
             'text_key': 'activate_trial_button',
             'type': 'callback',
             'callback_data': 'activate_trial',
-            'condition': not is_active or not expire_at,
+            'condition': (not is_active or not expire_at) and not trial_used,  # Не показываем, если триал уже использован
             'visibility_key': 'trial',
             'single': True
         },
@@ -342,7 +439,15 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
         
         # Создаём кнопку
         def create_button(b_id, b_def):
-            text = f"{b_def['icon']} {get_text(b_def['text_key'], user_lang)}"
+            # Для кнопки триала используем специальный текст из настроек
+            if b_id == 'trial':
+                trial_text = get_trial_button_text(user_lang)
+                if not trial_text:  # Если триал отключен, пропускаем кнопку
+                    return None
+                text = f"{b_def['icon']} {trial_text}"
+            else:
+                text = f"{b_def['icon']} {get_text(b_def['text_key'], user_lang)}"
+            
             if b_def['type'] == 'url':
                 return InlineKeyboardButton(text, url=b_def['url'])
             elif b_def['type'] == 'webapp':
@@ -350,23 +455,34 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
             else:
                 return InlineKeyboardButton(text, callback_data=b_def['callback_data'])
         
+        # Создаём кнопку
+        button = create_button(btn_id, btn_def)
+        
+        # Пропускаем кнопку если она None (например, триал отключен)
+        if button is None:
+            i += 1
+            continue
+        
         # Если кнопка одиночная или это последняя кнопка
         if btn_def['single'] or i == len(visible_buttons) - 1:
-            keyboard.append([create_button(btn_id, btn_def)])
+            keyboard.append([button])
             i += 1
         else:
             # Пытаемся создать пару
             next_btn_id, next_btn_def = visible_buttons[i + 1]
-            if next_btn_def['single']:
+            next_button = create_button(next_btn_id, next_btn_def)
+            
+            # Если следующая кнопка None, текущую одну
+            if next_button is None:
+                keyboard.append([button])
+                i += 1
+            elif next_btn_def['single']:
                 # Следующая одиночная — текущую одну
-                keyboard.append([create_button(btn_id, btn_def)])
+                keyboard.append([button])
                 i += 1
             else:
                 # Обе парные — создаём ряд из 2
-                keyboard.append([
-                    create_button(btn_id, btn_def),
-                    create_button(next_btn_id, next_btn_def)
-                ])
+                keyboard.append([button, next_button])
                 i += 2
     
     return keyboard
@@ -374,18 +490,28 @@ def build_main_menu_keyboard(user_lang: str, is_active: bool, subscription_url: 
 
 async def check_channel_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Проверить, подписан ли пользователь на канал"""
-    if not is_channel_subscription_required():
+    is_required = is_channel_subscription_required()
+    logger.info(f"Channel subscription check: required={is_required}, user_id={user_id}")
+    
+    if not is_required:
+        logger.info("Channel subscription not required, allowing access")
         return True
     
     channel_id = get_channel_id()
+    logger.info(f"Channel ID from config: '{channel_id}'")
+    
     if not channel_id:
+        logger.warning("Channel ID is empty, allowing access")
         return True
     
     try:
+        # Пробуем использовать channel_id как есть (может быть числовым ID или username)
         member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-        return member.status in ['member', 'administrator', 'creator']
+        is_subscribed = member.status in ['member', 'administrator', 'creator']
+        logger.info(f"User {user_id} subscription status: {member.status}, subscribed={is_subscribed}")
+        return is_subscribed
     except Exception as e:
-        logger.warning(f"Error checking channel subscription: {e}")
+        logger.warning(f"Error checking channel subscription for user {user_id}, channel '{channel_id}': {e}")
         return True  # В случае ошибки пропускаем проверку
 
 
@@ -430,6 +556,10 @@ async def reply_with_logo(update: Update, text: str, reply_markup=None, parse_mo
     Если текст длиннее 1024 символов, обрезает его.
     """
     try:
+        def _is_parse_entities_error(err: Exception) -> bool:
+            s = str(err).lower()
+            return ("can't parse entities" in s) or ("cant parse entities" in s) or ("can't parse" in s) or ("cant parse" in s)
+
         # Обрезаем текст до 1024 символов, чтобы всегда помещался в caption
         if len(text) > 1024:
             text = text[:1021] + "..."
@@ -459,7 +589,32 @@ async def reply_with_logo(update: Update, text: str, reply_markup=None, parse_mo
             )
     except Exception as e:
         logger.error(f"Ошибка при отправке сообщения с логотипом: {e}")
-        # В случае ошибки отправляем обычное сообщение
+        # Если упали на парсинге Markdown/HTML — пробуем отправить БЕЗ parse_mode
+        if parse_mode is not None and _is_parse_entities_error(e):
+            try:
+                fallback_text = clean_markdown_for_cards(text)
+                # 1) пробуем снова фото, но без parse_mode
+                if os.path.exists(LOGO_PATH):
+                    message = update.message if update.message else (update.callback_query.message if update.callback_query else None)
+                    if message:
+                        with open(LOGO_PATH, 'rb') as logo_file:
+                            await message.reply_photo(
+                                photo=logo_file,
+                                caption=fallback_text,
+                                reply_markup=reply_markup
+                            )
+                            return
+                # 2) если фото не вышло — обычный текст без parse_mode
+                if update.message:
+                    await update.message.reply_text(fallback_text, reply_markup=reply_markup)
+                    return
+                elif update.callback_query and update.callback_query.message:
+                    await update.callback_query.message.reply_text(fallback_text, reply_markup=reply_markup)
+                    return
+            except Exception as e_fallback:
+                logger.error(f"Fallback send without parse_mode failed: {e_fallback}")
+
+        # В случае любой другой ошибки отправляем обычное сообщение (как есть)
         try:
             if update.message:
                 await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -516,8 +671,41 @@ async def safe_edit_or_send_with_logo(update: Update, context: ContextTypes.DEFA
     has_photo = message.photo is not None and len(message.photo) > 0
     has_text = message.text is not None
     
-    # Сначала пробуем отредактировать caption (если это фото)
-    if has_photo:
+    # Если у нас есть логотип и мы хотим его показать, удаляем старое сообщение (даже если это фото)
+    # и отправляем новое с логотипом. Это нужно, чтобы вернуться от изображения тарифа к логотипу.
+    if has_photo and os.path.exists(LOGO_PATH):
+        # Удаляем старое сообщение с изображением (например, изображение тарифа)
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.debug(f"Could not delete old photo message: {e}")
+        
+        # Отправляем новое сообщение с логотипом
+        try:
+            with open(LOGO_PATH, 'rb') as logo_file:
+                return await context.bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=logo_file,
+                    caption=display_text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode
+                )
+        except Exception as e2:
+            logger.warning(f"Error sending photo with logo: {e2}")
+            # Fallback: отправляем без форматирования
+            try:
+                with open(LOGO_PATH, 'rb') as logo_file:
+                    return await context.bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=logo_file,
+                        caption=clean_markdown_for_cards(display_text),
+                        reply_markup=reply_markup
+                    )
+            except Exception as e3:
+                logger.error(f"Failed to send photo: {e3}")
+    
+    # Если нет логотипа, пробуем отредактировать caption (если это фото)
+    elif has_photo:
         try:
             await query.edit_message_caption(
                 caption=display_text,
@@ -663,6 +851,37 @@ class ClientBotAPI:
     def __init__(self, api_url: str):
         self.api_url = api_url.rstrip('/')
         self.session = requests.Session()
+        
+        # Настройка connection pooling для переиспользования соединений
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        # Настройка retry стратегии
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            raise_on_status=False
+        )
+        
+        # Настройка HTTP adapter с connection pooling
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=retry_strategy,
+            pool_block=False
+        )
+        
+        # Применяем adapter для HTTP и HTTPS
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Настройка keep-alive заголовков
+        self.session.headers.update({
+            'Connection': 'keep-alive',
+            'Keep-Alive': 'timeout=60, max=100'
+        })
     
     def get_user_by_telegram_id(self, telegram_id: int) -> Optional[dict]:
         """Получить пользователя по Telegram ID через API бота или создать JWT"""
@@ -733,34 +952,88 @@ class ClientBotAPI:
         return None
     
     def get_user_data(self, token: str, force_refresh: bool = False) -> Optional[dict]:
-        """Получить данные пользователя"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
-            # Добавляем timestamp для предотвращения кэширования
-            url = f"{self.api_url}/api/client/me"
-            if force_refresh:
-                url += f"?_t={int(datetime.now().timestamp() * 1000)}"
-            
-            response = self.session.get(
-                url,
-                headers=headers,
-                timeout=10
-            )
-            if response.status_code == 200:
-                data = response.json()
-                user_data = data.get("response") or data
-                # Логируем для отладки
-                if user_data:
-                    logger.debug(f"User data keys: {list(user_data.keys())[:15]}")
-                    logger.debug(f"User preferred_lang: {user_data.get('preferred_lang')}, preferred_currency: {user_data.get('preferred_currency')}")
-                return user_data
-        except Exception as e:
-            logger.error(f"Ошибка получения данных пользователя: {e}")
+        """Получить данные пользователя с retry логикой"""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+        # Добавляем timestamp для предотвращения кэширования
+        url = f"{self.api_url}/api/client/me"
+        if force_refresh:
+            url += f"?_t={int(datetime.now().timestamp() * 1000)}"
+        
+        # Retry логика с экспоненциальной задержкой
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    timeout=15  # Увеличено до 15 секунд
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    user_data = data.get("response") or data
+                    # Логируем для отладки
+                    if user_data:
+                        logger.debug(f"User data keys: {list(user_data.keys())[:15]}")
+                        logger.debug(f"User preferred_lang: {user_data.get('preferred_lang')}, preferred_currency: {user_data.get('preferred_currency')}")
+                    return user_data
+                elif response.status_code == 401:
+                    # Не валидный токен, не повторяем
+                    logger.warning(f"Unauthorized access attempt (401) for get_user_data")
+                    return None
+                else:
+                    logger.warning(f"HTTP {response.status_code} при получении данных пользователя (попытка {attempt + 1}/{max_retries})")
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout при получении данных пользователя (попытка {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(2 ** attempt)  # Экспоненциальная задержка: 1s, 2s, 4s
+                else:
+                    logger.error(f"Превышено максимальное количество попыток при получении данных пользователя")
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Ошибка соединения при получении данных пользователя (попытка {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(2 ** attempt)
+                    # Пытаемся пересоздать соединение
+                    try:
+                        self.session.close()
+                        self.session = requests.Session()
+                        # Повторно применяем adapter
+                        from requests.adapters import HTTPAdapter
+                        from urllib3.util.retry import Retry
+                        retry_strategy = Retry(
+                            total=3,
+                            backoff_factor=1,
+                            status_forcelist=[429, 500, 502, 503, 504],
+                            allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+                            raise_on_status=False
+                        )
+                        adapter = HTTPAdapter(
+                            pool_connections=10,
+                            pool_maxsize=20,
+                            max_retries=retry_strategy,
+                            pool_block=False
+                        )
+                        self.session.mount("http://", adapter)
+                        self.session.mount("https://", adapter)
+                        self.session.headers.update({
+                            'Connection': 'keep-alive',
+                            'Keep-Alive': 'timeout=60, max=100'
+                        })
+                    except Exception as reset_error:
+                        logger.error(f"Ошибка при пересоздании сессии: {reset_error}")
+                else:
+                    logger.error(f"Превышено максимальное количество попыток при ошибке соединения")
+            except Exception as e:
+                logger.error(f"Неожиданная ошибка при получении данных пользователя: {e}")
+                if attempt == max_retries - 1:
+                    return None
+        
         return None
     
     def get_tariffs(self) -> list:
@@ -890,15 +1163,45 @@ class ClientBotAPI:
         except Exception as e:
             logger.error(f"Ошибка активации триала: {e}")
         return {"success": False, "message": "Ошибка активации триала"}
+
+    def get_configs(self, token: str, force_refresh: bool = False) -> dict:
+        """Получить список конфигов пользователя (primary + дополнительные)"""
+        try:
+            url = f"{self.api_url}/api/client/configs"
+            if force_refresh:
+                url += "?force_refresh=true"
+            response = self.session.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15
+            )
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            logger.error(f"Ошибка получения конфигов: {e}")
+        return {"configs": []}
     
-    def create_payment(self, token: str, tariff_id: int, payment_provider: str, promo_code: Optional[str] = None) -> dict:
+    def create_payment(
+        self,
+        token: str,
+        tariff_id: int,
+        payment_provider: str,
+        promo_code: Optional[str] = None,
+        config_id: Optional[int] = None,
+        create_new_config: bool = False
+    ) -> dict:
         """Создать платеж"""
         try:
             payload = {
                 "tariff_id": tariff_id,
                 "payment_provider": payment_provider,
-                "promo_code": promo_code
+                "promo_code": promo_code,
+                "source": "bot"
             }
+            if config_id:
+                payload["config_id"] = int(config_id)
+            if create_new_config:
+                payload["create_new_config"] = True
             response = self.session.post(
                 f"{self.api_url}/api/client/create-payment",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -1003,6 +1306,8 @@ class ClientBotAPI:
 api = ClientBotAPI(FLASK_API_URL)
 
 # Кэш токенов пользователей (в продакшене лучше использовать Redis)
+# Формат:
+#   user_tokens[telegram_id] = {"token": "<jwt>", "exp": <epoch_seconds>}
 user_tokens = {}
 
 # Словари переводов для разных языков
@@ -1111,6 +1416,7 @@ TRANSLATIONS = {
         'main_menu_button': 'Главное меню',
         'status_button': 'Статус подписки',
         'tariffs_button': 'Тарифы',
+        'configs_button': 'Конфиги',
         'servers_button': 'Серверы',
         'referrals_button': 'Рефералы',
         'support_button': 'Поддержка',
@@ -1128,6 +1434,7 @@ TRANSLATIONS = {
         'unlimited_traffic_full': 'Безлимитный трафик',
         'use_login_password': 'Используйте этот логин и пароль для входа на сайте',
         'select_tariff_type': 'Выберите тип тарифа',
+        # Эти значения используются как fallback, основное название берется из брендинга
         'basic_tier': 'Базовый',
         'pro_tier': 'Премиум',
         'elite_tier': 'Элитный',
@@ -1327,6 +1634,7 @@ TRANSLATIONS = {
         'main_menu_button': 'Головне меню',
         'status_button': 'Статус підписки',
         'tariffs_button': 'Тарифи',
+        'configs_button': 'Конфіги',
         'servers_button': 'Сервери',
         'referrals_button': 'Реферали',
         'support_button': 'Підтримка',
@@ -1543,6 +1851,7 @@ TRANSLATIONS = {
         'main_menu_button': 'Main Menu',
         'status_button': 'Subscription Status',
         'tariffs_button': 'Tariffs',
+        'configs_button': 'Configs',
         'servers_button': 'Servers',
         'referrals_button': 'Referrals',
         'support_button': 'Support',
@@ -1759,6 +2068,7 @@ TRANSLATIONS = {
         'main_menu_button': '主菜单',
         'status_button': '订阅状态',
         'tariffs_button': '套餐',
+        'configs_button': '配置',
         'servers_button': '服务器',
         'referrals_button': '推荐',
         'support_button': '支持',
@@ -1923,15 +2233,85 @@ def get_user_lang(user_data: dict = None, context: ContextTypes.DEFAULT_TYPE = N
 def get_user_token(telegram_id: int) -> Optional[str]:
     """Получить или создать JWT токен для пользователя"""
     if telegram_id in user_tokens:
-        return user_tokens[telegram_id]
+        cached = user_tokens.get(telegram_id)
+        if isinstance(cached, str):
+            # обратная совместимость со старым форматом кеша
+            exp = _get_jwt_exp(cached)
+            user_tokens[telegram_id] = {"token": cached, "exp": exp}
+            cached = user_tokens.get(telegram_id)
+
+        if isinstance(cached, dict) and cached.get("token"):
+            exp = cached.get("exp")
+            # refresh если exp неизвестен или скоро истечёт
+            if exp and isinstance(exp, (int, float)):
+                # обновляем заранее за 30 минут до истечения
+                if exp - int(time.time()) > 30 * 60:
+                    return cached["token"]
+            else:
+                # если exp не удалось прочитать — всё равно попробуем токен, но параллельно обновим его ниже
+                return cached["token"]
     
     # Получаем токен через API
     token = api.get_user_by_telegram_id(telegram_id)
-    if token:
-        user_tokens[telegram_id] = token
+    if token and isinstance(token, str):
+        user_tokens[telegram_id] = {"token": token, "exp": _get_jwt_exp(token)}
         return token
+    # Иногда API возвращает dict (например, blocked)
+    return token
     
     return None
+
+
+def _get_jwt_exp(token: str) -> Optional[int]:
+    """Достать exp из JWT без проверки подписи (нужно для авто-refresh кеша)"""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1]
+        # base64url padding
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload_raw = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+        payload = json.loads(payload_raw.decode("utf-8"))
+        exp = payload.get("exp")
+        if isinstance(exp, (int, float)):
+            return int(exp)
+        # pyjwt иногда сериализует datetime, но у нас backend отдаёт epoch
+        return None
+    except Exception:
+        return None
+
+
+def clear_user_token_cache(telegram_id: int):
+    """Сбросить кеш токена, чтобы взять новый с API"""
+    try:
+        if telegram_id in user_tokens:
+            del user_tokens[telegram_id]
+    except Exception:
+        pass
+
+
+def get_user_data_safe(telegram_id: int, token: Optional[str], force_refresh: bool = False):
+    """
+    Получить user_data. Если token протух/стал невалидным — автоматически обновит токен и повторит запрос.
+    Возвращает: (token, user_data)
+    """
+    if not token or not isinstance(token, str):
+        return token, None
+
+    user_data = api.get_user_data(token, force_refresh=force_refresh)
+    if user_data:
+        return token, user_data
+
+    # Наиболее частая причина: протухший JWT из кеша. Обновляем и пробуем ещё раз.
+    clear_user_token_cache(telegram_id)
+    new_token = get_user_token(telegram_id)
+    if new_token and isinstance(new_token, str):
+        user_data = api.get_user_data(new_token, force_refresh=force_refresh)
+        if user_data:
+            return new_token, user_data
+
+    return token, None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1981,18 +2361,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        text = f"👋 {get_text('welcome_bot', lang)}\n\n"
-        text += f"❌ {get_text('not_registered_text', lang)}\n\n"
-        text += f"📝 {get_text('register_here', lang)}\n\n"
-        text += f"💡 {get_text('after_register', lang)}"
-        if referral_code:
-            text += f"\n\n🎁 Реферальный код: `{referral_code}`"
+        # Проверяем, есть ли кастомное приветственное сообщение для незарегистрированных
+        custom_welcome = get_custom_welcome_message(lang)
+        if custom_welcome and custom_welcome.strip():
+            # Используем кастомное сообщение
+            text = custom_welcome.replace('{SERVICE_NAME}', get_service_name())
+            text = text.replace('{USER_NAME}', user.first_name or '')
+            text = text.replace('{user_name}', user.first_name or '')
+            if referral_code:
+                text += f"\n\n🎁 Реферальный код: `{referral_code}`"
+        else:
+            # Стандартное сообщение
+            text = f"👋 {get_text('welcome_bot', lang)}\n\n"
+            text += f"❌ {get_text('not_registered_text', lang)}\n\n"
+            text += f"📝 {get_text('register_here', lang)}\n\n"
+            text += f"💡 {get_text('after_register', lang)}"
+            if referral_code:
+                text += f"\n\n🎁 Реферальный код: `{referral_code}`"
         
         await reply_with_logo(update, text, reply_markup=reply_markup)
         return
     
-    # Получаем данные пользователя
-    user_data = api.get_user_data(token)
+    # Получаем данные пользователя (с авто-refresh токена)
+    token, user_data = get_user_data_safe(telegram_id, token)
     
     if not user_data:
         lang = get_user_lang(None, context, token)
@@ -2002,7 +2393,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем язык пользователя
     user_lang = get_user_lang(user_data, context, token)
     
-    # Формируем приветственное сообщение с подробной информацией
+    # Получаем данные для клавиатуры
+    is_active = user_data.get("activeInternalSquads", [])
+    expire_at = user_data.get("expireAt")
+    subscription_url = user_data.get("subscriptionUrl", "")
+    used_traffic = user_data.get("usedTrafficBytes", 0)
+    traffic_limit = user_data.get("trafficLimitBytes", 0)
+    
+    # Проверяем, есть ли активная подписка (не истекшая)
+    has_active_subscription = False
+    expire_date = None
+    days_left = 0
+    
+    if is_active and expire_at:
+        expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
+        now = datetime.now(expire_date.tzinfo)
+        delta = expire_date - now
+        days_left = delta.days
+        
+        # Подписка активна только если не истекла
+        has_active_subscription = days_left > 0
+    
+    # ВАЖНО: /start всегда должен показывать главное меню (баланс/статус/трафик),
+    # чтобы кастомные тексты (например, из рассылок) не подменяли основной экран.
     welcome_text = f"🛡 **{get_text('stealthnet_bot', user_lang)}**\n"
     welcome_text += f"👋 {get_text('welcome_user', user_lang)}, {user.first_name}!\n"
     welcome_text += "━━━━━━━━━━━━━━━\n"
@@ -2014,16 +2427,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text += f"💰 **{get_text('balance', user_lang)}:** {balance:.2f} {currency_symbol}\n"
     
     # Статус подписки
-    is_active = user_data.get("activeInternalSquads", [])
-    expire_at = user_data.get("expireAt")
-    subscription_url = user_data.get("subscriptionUrl", "")
-    used_traffic = user_data.get("usedTrafficBytes", 0)
-    traffic_limit = user_data.get("trafficLimitBytes", 0)
-    
-    if is_active and expire_at:
-        expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
-        days_left = (expire_date - datetime.now(expire_date.tzinfo)).days
-        
+    if has_active_subscription and expire_date:
         # Статус с индикатором - в одну строку
         status_icon = "🟢" if days_left > 7 else "🟡" if days_left > 0 else "🔴"
         welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}** - {status_icon} {get_text('active', user_lang)}\n"
@@ -2038,7 +2442,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             welcome_text += f"📅 {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
         
-        # Дни с правильным склонением
+        # Дни с правильным склонением (days_left уже > 0 здесь)
         if user_lang == 'ru':
             if days_left == 1:
                 days_text = f"{days_left} день"
@@ -2085,7 +2489,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text += "━━━━━━━━━━━━━━━\n"
     
     # Кнопки главного меню - строим динамически из конфига
-    keyboard = build_main_menu_keyboard(user_lang, is_active, subscription_url, expire_at)
+    # Используем has_active_subscription для правильного отображения кнопок
+    trial_used = user_data.get('trial_used', False)  # Получаем информацию об использовании триала
+    keyboard = build_main_menu_keyboard(user_lang, has_active_subscription, subscription_url, expire_at, trial_used)
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -2131,7 +2537,18 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer(f"❌ {get_text('auth_error', lang)}")
         return
     
-    user_data = api.get_user_data(token)
+    # Попробуем обработать "зависшие" оплаты (если webhook не дошел), затем обновим профиль
+    try:
+        api.session.post(
+            f"{FLASK_API_URL}/api/client/payments/reconcile",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+            timeout=15
+        )
+    except Exception:
+        pass
+
+    token, user_data = get_user_data_safe(telegram_id, token, force_refresh=True)
     if not user_data:
         lang = get_user_lang(None, context, token)
         await update.callback_query.answer(f"❌ {get_text('failed_to_load', lang)}")
@@ -2156,10 +2573,21 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Баланс
     status_text += f"💰 **Баланс:** {balance:.2f} {currency_symbol}\n\n"
     
+    # Проверяем, есть ли активная подписка (не истекшая)
+    has_active_subscription = False
+    expire_date = None
+    days_left = 0
+    
     if is_active and expire_at:
         expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
-        days_left = (expire_date - datetime.now(expire_date.tzinfo)).days
+        now = datetime.now(expire_date.tzinfo)
+        delta = expire_date - now
+        days_left = delta.days
         
+        # Подписка активна только если не истекла
+        has_active_subscription = days_left > 0
+    
+    if has_active_subscription and expire_date:
         # Статус - современный дизайн
         status_icon = "🟢" if days_left > 7 else "🟡" if days_left > 0 else "🔴"
         status_text += f"{status_icon} **{get_text('active', user_lang)}**\n"
@@ -2258,7 +2686,7 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Получаем валюту пользователя
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
     
     currency_map = {
@@ -2297,6 +2725,12 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             basic_tariffs.append(tariff)
     
+    # Получаем названия тарифов из брендинга
+    branding = api.get_branding()
+    basic_name = branding.get("tariff_tier_basic_name", "Базовый") or "Базовый"
+    pro_name = branding.get("tariff_tier_pro_name", "Премиум") or "Премиум"
+    elite_name = branding.get("tariff_tier_elite_name", "Элитный") or "Элитный"
+    
     # Формируем сообщение с выбором типа тарифа
     text = "💎 **Тарифные планы**\n"
     text += "━━━━━━━━━━━━━━━\n"
@@ -2304,26 +2738,26 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Показываем краткую информацию о каждом типе в одну строку
     if basic_tariffs:
         min_price = min(t.get(currency_config["field"], 0) for t in basic_tariffs)
-        text += f"📦 Базовый |💰От {min_price:.0f} {symbol} |📦 {len(basic_tariffs)} вариантов\n"
+        text += f"📦 {basic_name} |💰От {min_price:.0f} {symbol}\n"
     
     if pro_tariffs:
         min_price = min(t.get(currency_config["field"], 0) for t in pro_tariffs)
-        text += f"⭐️ Премиум |💰От {min_price:.0f} {symbol} |📦 {len(pro_tariffs)} вариантов\n"
+        text += f"⭐️ {pro_name} |💰От {min_price:.0f} {symbol}\n"
     
     if elite_tariffs:
         min_price = min(t.get(currency_config["field"], 0) for t in elite_tariffs)
-        text += f"👑 Элитный |💰От {min_price:.0f} {symbol} |📦 {len(elite_tariffs)} вариантов\n"
+        text += f"👑 {elite_name} |💰От {min_price:.0f} {symbol}\n"
     
     text += "━━━━━━━━━━━━━━━\n"
     
     # Кнопки выбора типа тарифа
     keyboard = []
     if basic_tariffs:
-        keyboard.append([InlineKeyboardButton("📦 Базовый", callback_data="tier_basic")])
+        keyboard.append([InlineKeyboardButton(f"📦 {basic_name}", callback_data="tier_basic")])
     if pro_tariffs:
-        keyboard.append([InlineKeyboardButton("⭐ Премиум", callback_data="tier_pro")])
+        keyboard.append([InlineKeyboardButton(f"⭐ {pro_name}", callback_data="tier_pro")])
     if elite_tariffs:
-        keyboard.append([InlineKeyboardButton("👑 Элитный", callback_data="tier_elite")])
+        keyboard.append([InlineKeyboardButton(f"👑 {elite_name}", callback_data="tier_elite")])
     
     keyboard.append([
         InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")
@@ -2366,7 +2800,7 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
     
     # Получаем валюту пользователя
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
     
     currency_map = {
@@ -2379,12 +2813,18 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     price_field = currency_config["field"]
     symbol = currency_config["symbol"]
     
+    # Получаем названия тарифов из брендинга
+    branding = api.get_branding()
+    basic_name = branding.get("tariff_tier_basic_name", "Базовый") or "Базовый"
+    pro_name = branding.get("tariff_tier_pro_name", "Премиум") or "Премиум"
+    elite_name = branding.get("tariff_tier_elite_name", "Элитный") or "Элитный"
+    
     # Фильтруем тарифы по tier
     tier_tariffs = []
     tier_names = {
-        "basic": "📦 Базовый",
-        "pro": "⭐ Премиум",
-        "elite": "👑 Элитный"
+        "basic": f"📦 {basic_name}",
+        "pro": f"⭐ {pro_name}",
+        "elite": f"👑 {elite_name}"
     }
     
     for tariff in tariffs:
@@ -2418,84 +2858,211 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     branding = api.get_branding()
     features_names = branding.get("tariff_features_names", {})
     
-    # Формируем сообщение
-    tier_name = tier_names.get(tier, tier.capitalize())
-    text = f"{tier_name} **тарифы**\n"
-    text += "━━━━━━━━━━━━━━━\n"
+    # Подготавливаем функции для генерации изображения
+    processed_features = []
+    for feature in features_list[:5]:  # Берем первые 5 функций
+        if isinstance(feature, dict):
+            feature_key = feature.get("key") or feature.get("name")
+            feature_name = feature.get("name") or feature.get("title")
+            # Пробуем получить название из брендинга
+            if feature_key and features_names and isinstance(features_names, dict):
+                branded_name = features_names.get(feature_key)
+                if branded_name:
+                    feature_name = branded_name
+            if not feature_name:
+                feature_name = feature_key or "Функция"
+            
+            icon = feature.get("icon", "✓")
+            processed_features.append({
+                "name": feature_name,
+                "icon": icon
+            })
+        elif isinstance(feature, str):
+            processed_features.append({
+                "name": feature,
+                "icon": "✓"
+            })
     
-    # Показываем функции тарифа, если есть
-    if features_list:
-        text += "✨ **Включено в тариф:**\n"
-        for feature in features_list[:5]:  # Показываем первые 5 функций
-            if isinstance(feature, dict):
-                feature_key = feature.get("key") or feature.get("name")
-                feature_name = feature.get("name") or feature.get("title")
-                # Пробуем получить название из брендинга
-                if feature_key and features_names and isinstance(features_names, dict):
-                    branded_name = features_names.get(feature_key)
-                    if branded_name:
-                        feature_name = branded_name
-                if not feature_name:
-                    feature_name = feature_key or "Функция"
-                
-                icon = feature.get("icon", "✓")
-                text += f"{icon} {feature_name}\n"
-            elif isinstance(feature, str):
-                text += f"✓ {feature}\n"
-        if len(features_list) > 5:
-            text += f"... и еще {len(features_list) - 5} функций\n"
-        text += "\n"
+    # Определяем название тарифа и иконку
+    tier_display_info = {
+        "basic": {"name": basic_name, "icon": "📦"},
+        "pro": {"name": pro_name, "icon": "⭐"},
+        "elite": {"name": elite_name, "icon": "👑"}
+    }
+    tier_info = tier_display_info.get(tier, {"name": tier.capitalize(), "icon": "📦"})
     
-    text += "📅 Выберите длительность:\n\n"
-    
-    # Показываем список тарифов в одну строку
-    for tariff in tier_tariffs:
-        name = tariff.get("name", f"{tariff.get('duration_days', 0)} дней")
-        price = tariff.get(price_field, 0)
-        duration = tariff.get("duration_days", 0)
-        per_day = price / duration if duration > 0 else price
+    # Генерируем изображение
+    try:
+        from modules.image_generator import generate_tariff_image
+        from io import BytesIO
         
-        text += f"📦 **{name}** | 💰 {price:.0f} {symbol} | 📊 {per_day:.2f} {symbol}/день | ⏱️ {duration} дней\n\n"
-    
-    text += "━━━━━━━━━━━━━━━\n"
-    
-    # Кнопки выбора длительности
-    keyboard = []
-    row = []
-    for tariff in tier_tariffs:
-        duration = tariff.get("duration_days", 0)
-        name = f"{duration} дн."
-        if len(name) > 15:
-            name = f"{duration}д"
+        # Получаем цвет из брендинга (если есть)
+        primary_color_hex = branding.get("primary_color", "#3f69ff")
+        # Конвертируем hex в RGB tuple
+        try:
+            hex_color = primary_color_hex.lstrip('#')
+            if len(hex_color) == 3:
+                hex_color = ''.join([c*2 for c in hex_color])
+            primary_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        except:
+            primary_color = (63, 105, 255)  # Синий по умолчанию
         
-        row.append(InlineKeyboardButton(
-            name,
-            callback_data=f"tariff_{tariff.get('id')}"
-        ))
-        if len(row) == 2:
+        image_bytes = generate_tariff_image(
+            tier_name=tier_info["name"],
+            tier_icon=tier_info["icon"],
+            features=processed_features,
+            tariffs=tier_tariffs,
+            currency=currency,
+            currency_symbol=symbol,
+            primary_color=primary_color
+        )
+        
+        # Кнопки выбора длительности
+        keyboard = []
+        row = []
+        for tariff in tier_tariffs:
+            duration = tariff.get("duration_days", 0)
+            name = f"{duration} дн."
+            if len(name) > 15:
+                name = f"{duration}д"
+            
+            row.append(InlineKeyboardButton(
+                name,
+                callback_data=f"tariff_{tariff.get('id')}"
+            ))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        
+        if row:
             keyboard.append(row)
-            row = []
-    
-    if row:
-        keyboard.append(row)
-    
-    keyboard.append([
-        InlineKeyboardButton("🔙 К выбору типа", callback_data="tariffs")
-    ])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Используем безопасную функцию для редактирования/отправки
-    temp_update = Update(update_id=0, callback_query=query)
-    if has_cards(text):
-        text_clean = clean_markdown_for_cards(text)
-        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
-    else:
-        # Для текста без карточек используем Markdown
+        
+        keyboard.append([
+            InlineKeyboardButton("🔙 К выбору типа", callback_data="tariffs")
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Отправляем изображение
+        photo_file = BytesIO(image_bytes)
+        photo_file.name = f"tariff_{tier}.png"
+        
+        # Пытаемся удалить старое сообщение
+        try:
+            await query.message.delete()
+        except:
+            pass
+        
+        # Отправляем новое сообщение с изображением
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=photo_file,
+            caption="Выберите длительность:",
+            reply_markup=reply_markup
+        )
+        
+    except ImportError:
+        # Если модуль не найден, используем текстовую версию (fallback)
+        logger.warning("Image generator module not found, using text version")
+        text = f"{tier_info['icon']} {tier_info['name']}\n"
+        text += "━━━━━━━━━━━━━━━\n"
+        
+        if processed_features:
+            text += "✨ **Включено в тариф:**\n"
+            for feature in processed_features:
+                text += f"{feature['icon']} {feature['name']}\n"
+            if len(features_list) > 5:
+                text += f"... и еще {len(features_list) - 5} функций\n"
+            text += "\n"
+        
+        text += "📅 Выберите длительность:\n\n"
+        
+        for tariff in tier_tariffs:
+            name = tariff.get("name", f"{tariff.get('duration_days', 0)} дней")
+            price = tariff.get(price_field, 0)
+            duration = tariff.get("duration_days", 0)
+            per_day = price / duration if duration > 0 else price
+            text += f"📦 {name} | 💰 {price:.0f} {symbol} | 📊 {per_day:.2f} {symbol}/день | ⏱️ {duration} дней\n"
+        
+        text += "━━━━━━━━━━━━━━━\n"
+        
+        keyboard = []
+        row = []
+        for tariff in tier_tariffs:
+            duration = tariff.get("duration_days", 0)
+            name = f"{duration} дн."
+            if len(name) > 15:
+                name = f"{duration}д"
+            row.append(InlineKeyboardButton(name, callback_data=f"tariff_{tariff.get('id')}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("🔙 К выбору типа", callback_data="tariffs")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        temp_update = Update(update_id=0, callback_query=query)
         try:
             await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"Error in show_tier_tariffs, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error generating tariff image: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # Fallback на текстовую версию при ошибке
+        try:
+            await query.answer("⚠️ Ошибка генерации изображения, используем текстовую версию")
+        except:
+            pass
+        
+        # Отправляем текстовую версию
+        text = f"{tier_info['icon']} {tier_info['name']}\n"
+        text += "━━━━━━━━━━━━━━━\n"
+        
+        if processed_features:
+            text += "✨ **Включено в тариф:**\n"
+            for feature in processed_features:
+                text += f"{feature['icon']} {feature['name']}\n"
+            if len(features_list) > 5:
+                text += f"... и еще {len(features_list) - 5} функций\n"
+            text += "\n"
+        
+        text += "📅 Выберите длительность:\n\n"
+        
+        for tariff in tier_tariffs:
+            name = tariff.get("name", f"{tariff.get('duration_days', 0)} дней")
+            price = tariff.get(price_field, 0)
+            duration = tariff.get("duration_days", 0)
+            per_day = price / duration if duration > 0 else price
+            text += f"📦 {name} | 💰 {price:.0f} {symbol} | 📊 {per_day:.2f} {symbol}/день | ⏱️ {duration} дней\n"
+        
+        text += "━━━━━━━━━━━━━━━\n"
+        
+        keyboard = []
+        row = []
+        for tariff in tier_tariffs:
+            duration = tariff.get("duration_days", 0)
+            name = f"{duration} дн."
+            if len(name) > 15:
+                name = f"{duration}д"
+            row.append(InlineKeyboardButton(name, callback_data=f"tariff_{tariff.get('id')}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("🔙 К выбору типа", callback_data="tariffs")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        temp_update = Update(update_id=0, callback_query=query)
+        try:
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception as e2:
+            logger.warning(f"Error in show_tier_tariffs fallback, sending without formatting: {e2}")
             text_clean = clean_markdown_for_cards(text)
             await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
 
@@ -2511,7 +3078,7 @@ async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Проверяем активность подписки
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     if not user_data:
         await update.callback_query.answer("❌ Не удалось загрузить данные")
         return
@@ -2591,7 +3158,7 @@ async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("❌ Ошибка авторизации")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     if not user_data:
         await update.callback_query.answer("❌ Не удалось загрузить данные")
         return
@@ -2735,11 +3302,16 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lang = get_user_lang(None, context, token)
         await update.callback_query.answer(f"❌ {get_text('auth_error', lang)}")
         return
-    
-    tickets = api.get_support_tickets(token)
-    
-    user_data = api.get_user_data(token)
+
+    token, user_data = get_user_data_safe(telegram_id, token)
+    if not user_data:
+        lang = get_user_lang(None, context, token)
+        await update.callback_query.answer(f"❌ {get_text('failed_to_load', lang)}")
+        return
+
     user_lang = get_user_lang(user_data, context, token)
+
+    tickets = api.get_support_tickets(token)
     
     text = f"💬 **{get_text('support_title', user_lang)}**\n"
     text += "━━━━━━━━━━━━━━━\n\n"
@@ -3422,7 +3994,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         token = get_user_token(telegram_id)
         if token:
-            user_data = api.get_user_data(token)
+            token, user_data = get_user_data_safe(telegram_id, token)
             
             if user_data:
                 # Получаем язык пользователя
@@ -3445,10 +4017,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 used_traffic = user_data.get("usedTrafficBytes", 0)
                 traffic_limit = user_data.get("trafficLimitBytes", 0)
                 
+                # Проверяем, есть ли активная подписка (не истекшая)
+                has_active_subscription = False
+                expire_date = None
+                days_left = 0
+                
                 if is_active and expire_at:
                     expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
-                    days_left = (expire_date - datetime.now(expire_date.tzinfo)).days
+                    now = datetime.now(expire_date.tzinfo)
+                    delta = expire_date - now
+                    days_left = delta.days
                     
+                    # Подписка активна только если не истекла
+                    has_active_subscription = days_left > 0
+                
+                if has_active_subscription and expire_date:
                     # Статус с индикатором - в одну строку
                     status_icon = "🟢" if days_left > 7 else "🟡" if days_left > 0 else "🔴"
                     welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}** - {status_icon} {get_text('active', user_lang)}\n"
@@ -3463,7 +4046,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         welcome_text += f"📅 {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
                     
-                    # Дни с правильным склонением
+                    # Дни с правильным склонением (days_left уже > 0 здесь)
                     if user_lang == 'ru':
                         if days_left == 1:
                             days_text = f"{days_left} день"
@@ -3509,7 +4092,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     welcome_text += "━━━━━━━━━━━━━━━\n"
                 
                 # Используем build_main_menu_keyboard для правильного порядка кнопок из админки
-                keyboard = build_main_menu_keyboard(user_lang, is_active, subscription_url, expire_at)
+                # Используем has_active_subscription для правильного отображения кнопок
+                trial_used = user_data.get('trial_used', False)  # Получаем информацию об использовании триала
+                keyboard = build_main_menu_keyboard(user_lang, has_active_subscription, subscription_url, expire_at, trial_used)
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 # Используем безопасную функцию для редактирования/отправки
@@ -3534,9 +4119,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [
                 InlineKeyboardButton(f"📊 {get_text('status_button', lang)}", callback_data="status"),
-                InlineKeyboardButton(f"💎 {get_text('tariffs_button', lang)}", callback_data="tariffs")
+                InlineKeyboardButton(f"🧩 {get_text('configs_button', lang)}", callback_data="configs")
             ],
             [
+                InlineKeyboardButton(f"💎 {get_text('tariffs_button', lang)}", callback_data="tariffs"),
                 InlineKeyboardButton(f"💰 {get_text('top_up_balance', lang)}", callback_data="topup_balance"),
                 InlineKeyboardButton(f"🌐 {get_text('servers_button', lang)}", callback_data="servers")
             ],
@@ -3564,7 +4150,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "status":
         await show_status(update, context)
     
+    elif data == "configs":
+        await show_configs(update, context)
+    
     elif data == "tariffs":
+        await show_tariffs(update, context)
+
+    elif data == "tariffs_newcfg":
+        # Пользователь хочет оплатить создание нового конфига
+        context.user_data["preferred_config_id"] = None
+        context.user_data["preferred_create_new_config"] = True
+        await show_tariffs(update, context)
+    
+    elif data.startswith("tariffs_cfg_"):
+        try:
+            cfg_id = int(data.replace("tariffs_cfg_", ""))
+            context.user_data["preferred_config_id"] = cfg_id
+            context.user_data["preferred_create_new_config"] = False
+        except Exception:
+            context.user_data["preferred_config_id"] = None
+            context.user_data["preferred_create_new_config"] = False
         await show_tariffs(update, context)
     
     elif data.startswith("tier_"):
@@ -3601,7 +4206,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"❌ {get_text('auth_error', lang)}")
             return
         
-        user_data_api = api.get_user_data(token)
+        token, user_data_api = get_user_data_safe(telegram_id, token)
         if not user_data_api:
             lang = get_user_lang(None, context, token)
             await query.answer(f"❌ {get_text('failed_to_load', lang)}")
@@ -3651,7 +4256,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         telegram_id = user.id
         token = get_user_token(telegram_id)
-        user_data = api.get_user_data(token) if token else None
+        token, user_data = get_user_data_safe(telegram_id, token) if token else (token, None)
         user_lang = get_user_lang(user_data, context, token)
         
         # Получаем домен сервера из API
@@ -3696,7 +4301,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         telegram_id = user.id
         token = get_user_token(telegram_id)
-        user_data = api.get_user_data(token) if token else None
+        token, user_data = get_user_data_safe(telegram_id, token) if token else (token, None)
         user_lang = get_user_lang(user_data, context, token)
         
         temp_update = Update(update_id=0, callback_query=query)
@@ -3722,7 +4327,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = update.effective_user
             telegram_id = user.id
             token = get_user_token(telegram_id)
-            user_data = api.get_user_data(token) if token else None
+            token, user_data = get_user_data_safe(telegram_id, token) if token else (token, None)
             user_lang = get_user_lang(user_data, context, token)
             
             temp_update = Update(update_id=0, callback_query=query)
@@ -3740,7 +4345,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = update.effective_user
             telegram_id = user.id
             token = get_user_token(telegram_id)
-            user_data = api.get_user_data(token) if token else None
+            token, user_data = get_user_data_safe(telegram_id, token) if token else (token, None)
             user_lang = get_user_lang(user_data, context, token)
             await query.answer(f"❌ {get_text('invalid_ticket_id', user_lang)}")
     
@@ -3794,7 +4399,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Ошибка авторизации")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     if not user_data:
         await query.answer("❌ Не удалось загрузить данные")
         return
@@ -3887,7 +4492,7 @@ async def set_currency(update: Update, context: ContextTypes.DEFAULT_TYPE, curre
         return
     
     # Проверяем текущую валюту
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     current_currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
     
     if current_currency == currency:
@@ -3929,7 +4534,7 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang:
         await query.answer("❌ Ошибка авторизации")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     if not user_data:
         await query.answer("❌ Не удалось загрузить данные")
         return
@@ -4033,7 +4638,7 @@ async def view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket
         await query.answer(f"❌ {get_text('auth_error', lang)}")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     user_lang = get_user_lang(user_data, context, token)
     
     await query.answer(f"⏳ {get_text('loading_ticket', user_lang)}...")
@@ -4164,10 +4769,14 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Проверяем подписку на канал если требуется
     if is_channel_subscription_required():
+        logger.info(f"Channel subscription required, checking for user {telegram_id}")
         is_subscribed = await check_channel_subscription(telegram_id, context)
         if not is_subscribed:
+            logger.info(f"User {telegram_id} is not subscribed, showing subscription requirement")
             await show_channel_subscription_required(update, context)
             return
+        else:
+            logger.info(f"User {telegram_id} is subscribed, proceeding with registration")
     
     # Начинаем процесс регистрации - сначала выбор языка
     # Используем русский по умолчанию для незарегистрированных
@@ -4422,7 +5031,11 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     
     # Сохраняем токен в кэш (если он есть)
     if result.get("token"):
-        user_tokens[telegram_id] = result["token"]
+        tok = result["token"]
+        if isinstance(tok, str):
+            user_tokens[telegram_id] = {"token": tok, "exp": _get_jwt_exp(tok)}
+        else:
+            user_tokens[telegram_id] = tok
     
     # Очищаем временные данные регистрации
     context.user_data.pop("reg_lang", None)
@@ -4444,7 +5057,7 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"❌ {get_text('auth_error', lang)}", show_alert=True)
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     user_lang = get_user_lang(user_data, context, token)
     
     await query.answer(f"⏳ {get_text('activating_trial', user_lang)}...")
@@ -4454,6 +5067,9 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Получаем настройки триала для сообщения об успехе
+    trial_settings = get_trial_settings()
+    
     # Проверяем результат активации
     if result and "message" in result:
         message_text = result.get("message", "").lower()
@@ -4462,9 +5078,18 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
            "активирован" in message_text or \
            "успешно" in message_text or \
            result.get("success", False):
-            text = f"✅ **{get_text('trial_activated_title', user_lang)}**\n"
+            # Используем сообщение из настроек триала
+            activation_message_key = f'activation_message_{user_lang}'
+            activation_message = trial_settings.get(activation_message_key, '')
+            if not activation_message:
+                activation_message = trial_settings.get('activation_message_ru', '')
+            if not activation_message:
+                # Дефолтное сообщение
+                activation_message = f"✅ Триал активирован! Вам добавлено {trial_settings.get('days', 3)} дней премиум-доступа."
+            
+            # Форматируем сообщение
+            text = f"**{activation_message}**\n"
             text += "━━━━━━━━━━━━━━━\n\n"
-            text += f"{get_text('trial_days_received', user_lang)}\n"
             text += f"{get_text('enjoy_vpn', user_lang)}"
             
             temp_update = Update(update_id=0, callback_query=query)
@@ -4486,10 +5111,21 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
     elif result and result.get("success", False):
-        # Если есть поле success = True
-        text = f"✅ **{get_text('trial_activated_title', user_lang)}**\n"
+        # Если есть поле success = True - используем сообщение из API
+        message = result.get("message", "")
+        if message:
+            text = f"**{message}**\n"
+        else:
+            # Используем сообщение из настроек триала
+            activation_message_key = f'activation_message_{user_lang}'
+            activation_message = trial_settings.get(activation_message_key, '')
+            if not activation_message:
+                activation_message = trial_settings.get('activation_message_ru', '')
+            if not activation_message:
+                activation_message = f"✅ Триал активирован! Вам добавлено {trial_settings.get('days', 3)} дней премиум-доступа."
+            text = f"**{activation_message}**\n"
+        
         text += "━━━━━━━━━━━━━━━\n\n"
-        text += f"{get_text('trial_days_received', user_lang)}\n"
         text += f"{get_text('enjoy_vpn', user_lang)}"
         
         temp_update = Update(update_id=0, callback_query=query)
@@ -4545,7 +5181,7 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
         await query.answer("❌ Тариф не найден", show_alert=True)
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
     user_lang = get_user_lang(user_data, context, token)
     
@@ -4558,7 +5194,6 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
     price = tariff.get(currency_config["field"], 0)
     
     # Получаем баланс пользователя
-    user_data = api.get_user_data(token)
     balance = user_data.get("balance", 0) if user_data else 0
     preferred_currency = user_data.get("preferred_currency", currency) if user_data else currency
     balance_currency_config = currency_map.get(preferred_currency, currency_map["uah"])
@@ -4643,6 +5278,7 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
         'heleket': '₿ Heleket',
         'yookassa': '💳 YooKassa',
         'platega': '💳 Platega',
+        'platega_mir': '💳 Карты МИР',
         'mulenpay': '💳 Mulenpay',
         'urlpay': '💳 UrlPay',
         'telegram_stars': '⭐ Telegram Stars',
@@ -4712,8 +5348,15 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
             await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
 
 
-async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tariff_id: int, provider: str):
-    """Обработать создание платежа"""
+async def handle_payment(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tariff_id: int,
+    provider: str,
+    config_id: Optional[int] = None,
+    create_new_config: bool = False
+):
+    """Обработать создание платежа (с учетом выбора конфига)"""
     query = update.callback_query
     if not query:
         return
@@ -4727,7 +5370,7 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         await query.answer(f"❌ {get_text('auth_error', lang)}")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     user_lang = get_user_lang(user_data, context, token)
     
     # Если оплата с баланса, используем специальный endpoint
@@ -4735,10 +5378,16 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         await query.answer(f"⏳ Обработка оплаты с баланса...")
         
         try:
+            payload = {"tariff_id": tariff_id}
+            if config_id:
+                payload["config_id"] = int(config_id)
+            if create_new_config:
+                payload["create_new_config"] = True
+
             response = api.session.post(
                 f"{FLASK_API_URL}/api/client/purchase-with-balance",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"tariff_id": tariff_id},
+                json=payload,
                 timeout=30
             )
             result = response.json()
@@ -4788,7 +5437,13 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
     
     await query.answer(f"⏳ {get_text('creating_payment', user_lang)}...")
     
-    result = api.create_payment(token, tariff_id, provider)
+    result = api.create_payment(
+        token,
+        tariff_id,
+        provider,
+        config_id=config_id,
+        create_new_config=create_new_config
+    )
     
     if result.get("payment_url"):
         payment_url = result["payment_url"]
@@ -4849,6 +5504,119 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
             )
 
 
+async def choose_config_for_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tariff_id: int, provider: str):
+    """Шаг выбора конфига перед оплатой/продлением"""
+    query = update.callback_query
+    if not query:
+        return
+
+    user = update.effective_user
+    telegram_id = user.id
+
+    token = get_user_token(telegram_id)
+    if not token:
+        lang = get_user_lang(None, context, token)
+        await query.answer(f"❌ {get_text('auth_error', lang)}", show_alert=True)
+        return
+
+    token, user_data = get_user_data_safe(telegram_id, token)
+    user_lang = get_user_lang(user_data, context, token)
+
+    cfgs_resp = api.get_configs(token)
+    cfgs = (cfgs_resp or {}).get('configs') or []
+
+    text = "🧩 **Выберите конфиг для оплаты**\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
+    text += "Оплата/продление будет применено к выбранному конфигу.\n"
+
+    keyboard = []
+    for cfg in cfgs:
+        try:
+            cfg_id = cfg.get('id')
+            name = cfg.get('config_name') or f"Конфиг {cfg_id}"
+            is_primary = bool(cfg.get('is_primary'))
+            prefix = "⭐" if is_primary else "🧩"
+            keyboard.append([
+                InlineKeyboardButton(f"{prefix} {name}", callback_data=f"pay_{tariff_id}_{provider}_cfg_{cfg_id}")
+            ])
+        except Exception:
+            continue
+
+    # Кнопка "новый конфиг" — создаст новый конфиг после успешной оплаты
+    keyboard.append([
+        InlineKeyboardButton("➕ Новый конфиг", callback_data=f"pay_{tariff_id}_{provider}_newcfg")
+    ])
+
+    keyboard.append([
+        InlineKeyboardButton(f"🔙 {get_text('back_to_tariffs', user_lang)}", callback_data="tariffs")
+    ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    temp_update = Update(update_id=0, callback_query=query)
+    await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def show_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список конфигов пользователя и их статус"""
+    query = update.callback_query
+    if not query:
+        return
+
+    user = update.effective_user
+    telegram_id = user.id
+    token = get_user_token(telegram_id)
+    if not token:
+        lang = get_user_lang(None, context, token)
+        await query.answer(f"❌ {get_text('auth_error', lang)}", show_alert=True)
+        return
+
+    token, user_data = get_user_data_safe(telegram_id, token)
+    user_lang = get_user_lang(user_data, context, token)
+
+    cfgs_resp = api.get_configs(token, force_refresh=True)
+    cfgs = (cfgs_resp or {}).get('configs') or []
+
+    text = f"🧩 **{get_text('configs_button', user_lang)}**\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
+    if not cfgs:
+        text += "Конфиги не найдены.\n"
+    else:
+        for cfg in cfgs:
+            name = cfg.get('config_name') or f"Конфиг {cfg.get('id')}"
+            is_primary = bool(cfg.get('is_primary'))
+            status = "🟢 активен" if cfg.get('is_active') else "🔴 неактивен"
+            exp = cfg.get('expire_at')
+            if exp and isinstance(exp, str):
+                try:
+                    exp_dt = datetime.fromisoformat(exp.replace('Z', '+00:00'))
+                    exp_str = exp_dt.strftime('%d.%m.%Y %H:%M')
+                except Exception:
+                    exp_str = exp
+            else:
+                exp_str = "—"
+
+            text += f"{'⭐' if is_primary else '🧩'} **{name}**\n"
+            text += f"{status} • до {exp_str}\n\n"
+
+    keyboard = []
+    for cfg in cfgs:
+        cfg_id = cfg.get('id')
+        name = cfg.get('config_name') or f"Конфиг {cfg_id}"
+        sub_url = cfg.get('subscription_url')
+        row = []
+        if sub_url:
+            row.append(InlineKeyboardButton(f"🚀 {name}", url=sub_url))
+        row.append(InlineKeyboardButton("💎 Продлить", callback_data=f"tariffs_cfg_{cfg_id}"))
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("➕ Новый конфиг", callback_data="tariffs_newcfg")])
+    keyboard.append([InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    temp_update = Update(update_id=0, callback_query=query)
+    await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
 async def show_topup_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать форму пополнения баланса"""
     query = update.callback_query
@@ -4864,7 +5632,7 @@ async def show_topup_balance(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer(f"❌ {get_text('auth_error', lang)}")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     if not user_data:
         lang = get_user_lang(None, context, token)
         await query.answer(f"❌ {get_text('failed_to_load', lang)}")
@@ -4938,7 +5706,7 @@ async def select_topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE
             await reply_with_logo(temp_update, f"❌ {get_text('auth_error', lang)}")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     user_lang = get_user_lang(user_data, context, token)
     preferred_currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
     currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
@@ -4956,6 +5724,7 @@ async def select_topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE
         'heleket': '₿ Heleket',
         'yookassa': '💳 YooKassa',
         'platega': '💳 Platega',
+        'platega_mir': '💳 Карты МИР',
         'mulenpay': '💳 Mulenpay',
         'urlpay': '💳 UrlPay',
         'telegram_stars': '⭐ Telegram Stars',
@@ -5031,7 +5800,7 @@ async def handle_topup_payment(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(f"❌ {get_text('auth_error', lang)}")
         return
     
-    user_data = api.get_user_data(token)
+    token, user_data = get_user_data_safe(telegram_id, token)
     user_lang = get_user_lang(user_data, context, token)
     preferred_currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
     currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
@@ -5046,7 +5815,8 @@ async def handle_topup_payment(update: Update, context: ContextTypes.DEFAULT_TYP
                 "type": "balance_topup",
                 "amount": amount,
                 "currency": preferred_currency,
-                "payment_provider": provider
+                "payment_provider": provider,
+                "source": "bot"
             },
             timeout=30
         )
@@ -5115,14 +5885,55 @@ def main():
         query = update.callback_query
         if query and query.data and query.data.startswith("pay_"):
             try:
-                parts = query.data.split("_")
-                if len(parts) >= 3:
-                    tariff_id = int(parts[1])
-                    provider = "_".join(parts[2:])
-                    await handle_payment(update, context, tariff_id, provider)
-                    return  # Важно: возвращаемся, чтобы не обрабатывать дальше
-                else:
-                    await query.answer("❌ Неверный формат данных платежа")
+                raw = query.data
+
+                # Форматы:
+                # 1) pay_{tariffId}_{provider}                    -> показать выбор конфига
+                # 2) pay_{tariffId}_{provider}_cfg_{configId}     -> оплатить выбранный конфиг
+                # 3) pay_{tariffId}_{provider}_newcfg             -> создать новый конфиг после оплаты
+
+                parts = raw.split("_")
+                if len(parts) < 3:
+                    await query.answer("❌ Неверный формат данных платежа", show_alert=True)
+                    return
+
+                tariff_id = int(parts[1])
+
+                # Выбран конкретный конфиг
+                if "_cfg_" in raw:
+                    left, cfg_id_str = raw.split("_cfg_", 1)
+                    provider = left.split("_", 2)[2]  # pay, tariffId, provider(with underscores)
+                    config_id = int(cfg_id_str)
+                    await handle_payment(update, context, tariff_id, provider, config_id=config_id)
+                    return
+
+                # Новый конфиг
+                if raw.endswith("_newcfg"):
+                    left = raw[:-len("_newcfg")]
+                    provider = left.split("_", 2)[2]
+                    await handle_payment(update, context, tariff_id, provider, create_new_config=True)
+                    return
+
+                # Иначе это первый шаг: pay_{tariffId}_{provider}
+                provider = raw.split("_", 2)[2]
+                preferred_cfg = context.user_data.get("preferred_config_id")
+                preferred_new = bool(context.user_data.get("preferred_create_new_config"))
+
+                # Если пользователь пришел из "Мои конфиги" и выбрал конкретный конфиг — пропускаем шаг выбора
+                if preferred_new:
+                    context.user_data["preferred_config_id"] = None
+                    context.user_data["preferred_create_new_config"] = False
+                    await handle_payment(update, context, tariff_id, provider, create_new_config=True)
+                    return
+
+                if preferred_cfg:
+                    context.user_data["preferred_config_id"] = None
+                    context.user_data["preferred_create_new_config"] = False
+                    await handle_payment(update, context, tariff_id, provider, config_id=int(preferred_cfg))
+                    return
+
+                await choose_config_for_payment(update, context, tariff_id, provider)
+                return  # Важно: возвращаемся, чтобы не обрабатывать дальше
             except (ValueError, IndexError) as e:
                 logger.error(f"Payment callback error: {e}")
                 await query.answer("❌ Ошибка обработки платежа", show_alert=True)
@@ -5164,7 +5975,7 @@ def main():
                     result = api.create_support_ticket(token, subject, message)
                     
                     # Получаем язык пользователя для кнопки
-                    user_data_api = api.get_user_data(token) if token else None
+                    token, user_data_api = get_user_data_safe(telegram_id, token) if token else (token, None)
                     user_lang = get_user_lang(user_data_api, context, token)
                     
                     # API возвращает {"message": "Created", "ticket_id": nt.id} со статусом 201
@@ -5216,7 +6027,7 @@ def main():
                 
                 if token and ticket_id:
                     # Получаем язык пользователя для кнопок
-                    user_data_api = api.get_user_data(token)
+                    token, user_data_api = get_user_data_safe(telegram_id, token)
                     user_lang = get_user_lang(user_data_api, context, token)
                     
                     result = api.reply_to_ticket(token, ticket_id, message)
@@ -5260,7 +6071,7 @@ def main():
                 telegram_id = user.id
                 
                 token = get_user_token(telegram_id)
-                user_data_api = api.get_user_data(token) if token else None
+                token, user_data_api = get_user_data_safe(telegram_id, token) if token else (token, None)
                 user_lang = get_user_lang(user_data_api, context, token)
                 
                 try:
@@ -5333,7 +6144,7 @@ def main():
             await message.reply_text("❌ Ошибка авторизации")
             return
         
-        user_data = api.get_user_data(token)
+        token, user_data = get_user_data_safe(telegram_id, token)
         user_lang = get_user_lang(user_data, context, token)
         
         # Платеж обрабатывается через вебхук, просто уведомляем пользователя

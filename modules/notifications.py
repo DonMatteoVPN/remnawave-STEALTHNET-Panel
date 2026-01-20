@@ -40,7 +40,9 @@ def send_admin_notification(text: str, bot_token: str = None):
         response = requests.post(url, json=payload, timeout=10)
         
         if response.status_code == 200:
-            return True, response.json().get('result', {}).get('message_id')
+            message_id = (response.json() or {}).get('result', {}).get('message_id')
+            print(f"Admin notification sent: group_id={group_id} message_id={message_id}", flush=True)
+            return True, message_id
         else:
             error_data = response.json() if response.content else {}
             error_msg = error_data.get('description', f'HTTP {response.status_code}')
@@ -52,7 +54,10 @@ def send_admin_notification(text: str, bot_token: str = None):
 def send_admin_notification_async(text: str, bot_token: str = None):
     """Отправить уведомление асинхронно (в фоне)"""
     def send():
-        send_admin_notification(text, bot_token)
+        ok, err = send_admin_notification(text, bot_token)
+        if not ok and err:
+            # Не падаем, но даем понятный след в логах API
+            print(f"Admin notification not sent: {err}")
     
     threading.Thread(target=send, daemon=True).start()
 
@@ -144,15 +149,14 @@ def notify_payment(payment, user, tariff=None, is_balance_topup=False):
 📅 Дата: {payment.created_at.strftime('%d.%m.%Y %H:%M') if payment.created_at else 'Неизвестно'}
 """
     
-    # Отправляем в оба бота (если доступны)
-    old_bot_token = os.getenv("CLIENT_BOT_TOKEN")
-    new_bot_token = os.getenv("CLIENT_BOT_V2_TOKEN")
-    
-    if old_bot_token:
-        send_admin_notification_async(text, old_bot_token)
-    
-    if new_bot_token and new_bot_token != old_bot_token:
-        send_admin_notification_async(text, new_bot_token)
+    # ВАЖНО: уведомления в админ-группу должны идти через ADMIN_GROUP_BOT_TOKEN.
+    # Ранее тут принудительно использовались токены клиентских ботов, из‑за чего
+    # уведомления могли "пропасть" (если клиентский бот не добавлен/не имеет прав в группе).
+    #
+    # Шлем синхронно: это webhook-критичный сценарий, лучше не терять уведомления.
+    ok, err = send_admin_notification(text)
+    if not ok and err:
+        print(f"Admin payment notification not sent: {err}", flush=True)
 
 
 def notify_support_ticket(ticket, user, message_text=None, is_new_ticket=False):
@@ -223,21 +227,21 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
             payment = Payment.query.filter_by(order_id=payment_order_id).first()
         except Exception as e:
             print(f"Error getting payment: {e}")
-    
+
     # Определяем тексты сообщений
     if is_successful:
         if is_balance_topup:
-            text = "✅ **Пополнение баланса успешно!**\n\n"
+            text = "✅ <b>Пополнение баланса успешно!</b>\n\n"
             text += "💰 Ваш баланс пополнен.\n\n"
         else:
-            text = "✅ **Оплата успешна!**\n\n"
+            text = "✅ <b>Оплата успешна!</b>\n\n"
             if tariff_name:
                 text += f"📦 Тариф: {tariff_name}\n\n"
             text += "🎉 Подписка активирована!\n\n"
         text += "━━━━━━━━━━━━━━━\n\n"
         text += "🔙 Вернуться в главное меню:"
     else:
-        text = "❌ **Оплата не успешна**\n\n"
+        text = "❌ <b>Оплата не успешна</b>\n\n"
         text += "⚠️ Произошла ошибка при обработке платежа.\n\n"
         text += "Пожалуйста, повторите попытку еще раз.\n\n"
         text += "━━━━━━━━━━━━━━━\n\n"
@@ -256,6 +260,8 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
     
     success = False
     error_msg = None
+    sent_via = None
+    sent_message_id = None
     
     # Сначала пробуем старый бот
     if old_bot_token:
@@ -264,7 +270,7 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
             payload = {
                 "chat_id": user.telegram_id,
                 "text": text,
-                "parse_mode": "Markdown",
+                "parse_mode": "HTML",
                 "reply_markup": keyboard,
                 "disable_web_page_preview": True
             }
@@ -272,6 +278,8 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
             
             if response.status_code == 200:
                 success = True
+                sent_via = "CLIENT_BOT_TOKEN"
+                sent_message_id = (response.json() or {}).get("result", {}).get("message_id")
             else:
                 error_data = response.json() if response.content else {}
                 error_msg = error_data.get('description', f'HTTP {response.status_code}')
@@ -285,7 +293,7 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
             payload = {
                 "chat_id": user.telegram_id,
                 "text": text,
-                "parse_mode": "Markdown",
+                "parse_mode": "HTML",
                 "reply_markup": keyboard,
                 "disable_web_page_preview": True
             }
@@ -294,11 +302,36 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
             if response.status_code == 200:
                 success = True
                 error_msg = None
+                sent_via = "CLIENT_BOT_V2_TOKEN"
+                sent_message_id = (response.json() or {}).get("result", {}).get("message_id")
             else:
                 error_data = response.json() if response.content else {}
                 error_msg = error_data.get('description', f'HTTP {response.status_code}')
         except Exception as e:
             error_msg = str(e)
+
+    # Если уведомление ушло — удаляем старое сообщение об оплате (чтобы бот не "висел" на оплате)
+    if success:
+        print(
+            f"User payment notification sent: user_id={getattr(user,'id',None)} chat_id={user.telegram_id} via={sent_via} message_id={sent_message_id}",
+            flush=True
+        )
+        try:
+            message_id = getattr(payment, "telegram_message_id", None) if payment else None
+            if message_id and user.telegram_id:
+                for tok in [old_bot_token, new_bot_token]:
+                    if not tok:
+                        continue
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{tok}/deleteMessage",
+                            json={"chat_id": user.telegram_id, "message_id": int(message_id)},
+                            timeout=10
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Error deleting old payment message: {e}")
     
     return success, error_msg
 
@@ -306,6 +339,9 @@ def send_user_payment_notification(user, is_successful=True, tariff_name=None, i
 def send_user_payment_notification_async(user, is_successful=True, tariff_name=None, is_balance_topup=False, payment_order_id=None, payment=None):
     """Отправить уведомление пользователю асинхронно (в фоне)"""
     def send():
-        send_user_payment_notification(user, is_successful, tariff_name, is_balance_topup, payment_order_id, payment)
+        ok, err = send_user_payment_notification(user, is_successful, tariff_name, is_balance_topup, payment_order_id, payment)
+        if not ok and err:
+            # Не падаем, но даем понятный след в логах API
+            print(f"User payment notification not sent: {err}")
     
     threading.Thread(target=send, daemon=True).start()

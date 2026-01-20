@@ -25,6 +25,7 @@ from modules.models.promo import PromoCode
 from modules.models.payment import Payment, PaymentSetting
 from modules.models.referral import ReferralSetting
 from modules.models.branding import BrandingSetting
+from modules.models.user_config import UserConfig
 
 app = get_app()
 db = get_db()
@@ -33,12 +34,41 @@ limiter = get_limiter()
 
 
 def decrypt_key(key):
-    fernet = get_fernet()
-    if not key or not fernet:
+    """
+    Расшифровка ключа из PaymentSetting.
+    Поддерживает TEXT (str) и варианты PostgreSQL (memoryview/bytes).
+    """
+    if not key:
         return ""
+
+    fernet = get_fernet()
+
     try:
-        return fernet.decrypt(key).decode('utf-8')
-    except:
+        # PostgreSQL может вернуть memoryview
+        if isinstance(key, memoryview):
+            key = bytes(key)
+
+        # Если ключ хранится как строка (PostgreSQL TEXT)
+        if isinstance(key, str):
+            # Если строка уже не зашифрована — возвращаем как есть
+            if not key.startswith('gAAAAAB'):
+                return key
+            # Зашифрована, но нет fernet — не можем расшифровать
+            if not fernet:
+                return ""
+            return fernet.decrypt(key.encode('utf-8')).decode('utf-8')
+
+        # Если bytes — пробуем расшифровать
+        if isinstance(key, (bytes, bytearray)):
+            if not fernet:
+                return ""
+            return fernet.decrypt(bytes(key)).decode('utf-8')
+
+        # Прочие типы — пытаемся привести к bytes
+        if not fernet:
+            return str(key)
+        return fernet.decrypt(bytes(key)).decode('utf-8')
+    except Exception:
         return ""
 
 
@@ -248,6 +278,8 @@ def miniapp_maintenance_status():
 @limiter.limit("10 per minute")
 def miniapp_activate_trial():
     """Активация триала"""
+    from modules.models.trial import get_trial_settings
+    
     try:
         data = request.json or {}
         init_data = data.get('initData', '')
@@ -260,27 +292,97 @@ def miniapp_activate_trial():
         if not user:
             return jsonify({"success": False, "message": "User not registered"}), 404
 
-        new_exp = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        # Проверяем, использовал ли пользователь уже триал (обновляем из БД)
+        db.session.refresh(user)
+        if hasattr(user, 'trial_used') and user.trial_used:
+            return jsonify({"success": False, "message": "Trial already used"}), 400
+
+        # Получаем настройки триала из БД
+        trial_settings = get_trial_settings()
+        
+        if not trial_settings.enabled:
+            return jsonify({"success": False, "message": "Trial is currently disabled"}), 400
+        
+        # Определяем, на какой конфиг активировать триал - только на основной!
+        from modules.models.user_config import UserConfig
+        primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+        
+        # Если нет основного конфига, но есть remnawave_uuid - создаем его
+        if not primary_config:
+            if user.remnawave_uuid and '@' not in user.remnawave_uuid:
+                primary_config = UserConfig(
+                    user_id=user.id,
+                    remnawave_uuid=user.remnawave_uuid,
+                    config_name='Основной конфиг',
+                    is_primary=True
+                )
+                db.session.add(primary_config)
+                db.session.flush()
+            else:
+                return jsonify({"success": False, "message": "Primary config not found. Please register first."}), 400
+        
+        # Используем remnawave_uuid из основного конфига
+        remnawave_uuid = primary_config.remnawave_uuid
+        
+        # Используем настройки из БД
+        trial_days = trial_settings.days
+        trial_devices = trial_settings.devices
+        
+        new_exp = (datetime.now(timezone.utc) + timedelta(days=trial_days)).isoformat()
 
         referral_settings = get_referral_settings()
         trial_squad_id = os.getenv("DEFAULT_SQUAD_ID")
         if referral_settings and referral_settings.trial_squad_id:
             trial_squad_id = referral_settings.trial_squad_id
 
+        # Формируем payload для обновления пользователя (только основной конфиг!)
+        patch_payload = {
+            "uuid": remnawave_uuid,
+            "expireAt": new_exp,
+            "activeInternalSquads": [trial_squad_id],
+            "hwidDeviceLimit": trial_devices
+        }
+        
+        # Если установлен лимит трафика, добавляем его
+        if trial_settings.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = trial_settings.traffic_limit_bytes
+
         resp = requests.patch(
             f"{os.getenv('API_URL')}/api/users",
             headers={"Authorization": f"Bearer {os.getenv('ADMIN_TOKEN')}"},
-            json={"uuid": user.remnawave_uuid, "expireAt": new_exp, "activeInternalSquads": [trial_squad_id]},
+            json=patch_payload,
             timeout=10
         )
 
         if resp.status_code != 200:
             return jsonify({"success": False, "message": "Failed to activate trial"}), 500
 
-        cache.delete(f'live_data_{user.remnawave_uuid}')
-        return jsonify({"success": True, "message": "Trial activated! +3 days"}), 200
+        # Отмечаем, что пользователь использовал триал (обновляем в БД)
+        user.trial_used = True
+        db.session.commit()
+
+        # Очищаем кэш для основного конфига
+        cache.delete(f'live_data_{remnawave_uuid}')
+        
+        # Очищаем кэш для основного конфига пользователя (если отличается)
+        if remnawave_uuid != user.remnawave_uuid:
+            cache.delete(f'live_data_{user.remnawave_uuid}')
+            cache.delete(f'nodes_{user.remnawave_uuid}')
+        
+        # Форматируем сообщение об успешной активации
+        lang = user.preferred_lang or 'ru'
+        activation_message = getattr(trial_settings, f'activation_message_{lang}', None)
+        if not activation_message:
+            activation_message = trial_settings.activation_message_ru or f"Trial activated! +{trial_days} days"
+        
+        # Заменяем {days} на актуальное значение
+        message = activation_message.replace("{days}", str(trial_days))
+        
+        return jsonify({"success": True, "message": message}), 200
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"success": False, "message": "Internal error"}), 500
 
 
@@ -308,12 +410,18 @@ def miniapp_payment_methods():
             available.append({"id": "crystalpay", "name": "CrystalPay", "type": "redirect"})
         if s.heleket_api_key and decrypt_key(s.heleket_api_key):
             available.append({"id": "heleket", "name": "Heleket (Крипто)", "type": "crypto"})
-        if s.yookassa_shop_id and decrypt_key(s.yookassa_shop_id):
+        # YooKassa - нужны shop_id и secret_key
+        if s.yookassa_shop_id and s.yookassa_secret_key and decrypt_key(s.yookassa_shop_id) and decrypt_key(s.yookassa_secret_key):
             available.append({"id": "yookassa", "name": "YooKassa", "type": "redirect"})
+        # YooMoney - нужны receiver и notification_secret
+        if getattr(s, 'yoomoney_receiver', None) and getattr(s, 'yoomoney_notification_secret', None) and decrypt_key(s.yoomoney_receiver) and decrypt_key(s.yoomoney_notification_secret):
+            available.append({"id": "yoomoney", "name": "YooMoney", "type": "redirect"})
         if s.telegram_bot_token and decrypt_key(s.telegram_bot_token):
             available.append({"id": "telegram_stars", "name": "Telegram Stars", "type": "telegram"})
         if getattr(s, 'platega_api_key', None) and decrypt_key(s.platega_api_key):
             available.append({"id": "platega", "name": "Platega", "type": "redirect"})
+            if getattr(s, 'platega_mir_enabled', False):
+                available.append({"id": "platega_mir", "name": "Карты МИР", "type": "redirect"})
         if getattr(s, 'monobank_token', None) and decrypt_key(s.monobank_token):
             available.append({"id": "monobank", "name": "Monobank", "type": "card"})
         if getattr(s, 'freekassa_shop_id', None) and decrypt_key(s.freekassa_shop_id):
@@ -370,12 +478,23 @@ def miniapp_create_payment():
         tariff_id = data.get('tariff_id') or data.get('tariffId')
         amount = data.get('amount')  # Для пополнения баланса
         payment_provider = data.get('payment_provider') or data.get('paymentProvider', 'crystalpay')
+        config_id = data.get('config_id') or data.get('configId')  # ID конфига для оплаты
+        create_new_config = data.get('create_new_config') or data.get('createNewConfig', False)  # Флаг создания нового конфига
         
         # Обработка промокода - опциональный параметр
         promo_code_raw = data.get('promo_code') or data.get('promoCode') or ''
         promo_code_str = promo_code_raw.strip().upper() if promo_code_raw and promo_code_raw.strip() else None
         
         currency = data.get('currency') or user.preferred_currency or 'rub'
+        
+        # Проверяем config_id, если указан
+        user_config = None
+        if config_id:
+            user_config = UserConfig.query.filter_by(id=config_id, user_id=user.id).first()
+            if not user_config:
+                return jsonify({
+                    "detail": {"title": "Invalid Config", "message": "Config not found or doesn't belong to user"}
+                }), 404
 
         # Проверяем, это пополнение баланса или покупка тарифа
         is_balance_topup = not tariff_id and amount
@@ -469,6 +588,31 @@ def miniapp_create_payment():
                         "detail": {"title": "Invalid Promo Code", "message": "Unknown promo code type"}
                     }), 400
 
+            # Если указан флаг create_new_config, не создаем конфиг сейчас - создадим после оплаты
+            # Если config_id не указан и не нужно создавать новый конфиг, используем основной конфиг
+            if not create_new_config:
+                if not user_config:
+                    primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+                    if not primary_config:
+                        # Если нет основного конфига, но есть remnawave_uuid - создаем его
+                        if user.remnawave_uuid and '@' not in user.remnawave_uuid:
+                            primary_config = UserConfig(
+                                user_id=user.id,
+                                remnawave_uuid=user.remnawave_uuid,
+                                config_name='Основной конфиг',
+                                is_primary=True
+                            )
+                            db.session.add(primary_config)
+                            db.session.flush()
+                            user_config = primary_config
+                        else:
+                            # Если нет remnawave_uuid, возвращаем ошибку
+                            return jsonify({
+                                "detail": {"title": "Error", "message": "User not registered in Remna. Please register first."}
+                            }), 400
+                    else:
+                        user_config = primary_config
+            
             # Создаем запись о платеже в БД
             import uuid
             order_id = f"SN-{uuid.uuid4().hex[:12].upper()}"
@@ -481,6 +625,8 @@ def miniapp_create_payment():
                 currency=info['c'],
                 payment_provider=payment_provider,
                 promo_code_id=promo_code_obj.id if promo_code_obj else None,
+                user_config_id=user_config.id if user_config else None,
+                create_new_config=create_new_config,  # Флаг создания нового конфига после оплаты
                 status='PENDING'
             )
             
@@ -648,7 +794,7 @@ def miniapp_payment_status():
             return response, 200
         
         # Если платеж Platega со статусом PENDING, проверяем статус через API
-        if p.payment_provider == 'platega' and p.status == 'PENDING' and p.payment_system_id:
+        if p.payment_provider in ('platega', 'platega_mir') and p.status == 'PENDING' and p.payment_system_id:
             try:
                 from modules.models.payment import PaymentSetting, decrypt_key
                 import requests
@@ -1301,10 +1447,9 @@ def miniapp_claim_promo_offer(offer_id):
 @limiter.limit("30 per minute")
 def miniapp_configs():
     """
-    Получить список конфигов пользователя.
+    Получить список всех конфигов пользователя.
     
-    Конфиги создаются автоматически при покупке тарифа через /miniapp/payments/create.
-    После успешной оплаты тарифа конфиг становится доступен через subscription URL.
+    Возвращает все конфиги пользователя, включая основной и дополнительные.
     """
     if request.method == 'OPTIONS':
         response = jsonify({})
@@ -1333,117 +1478,114 @@ def miniapp_configs():
             response.headers.add('Access-Control-Allow-Origin', '*')
             return response, 404
         
-        # Проверяем, что remnawave_uuid валидный (должен быть UUID, а не email)
-        if not user.remnawave_uuid:
-            response = jsonify({
-                "detail": {"title": "Error", "message": "User UUID not set. Please register in the bot first."}
-            })
-            response.headers.add('Access-Control-Allow-Origin', '*')
-            return response, 500
+        # Получаем все конфиги пользователя
+        user_configs = UserConfig.query.filter_by(user_id=user.id).order_by(UserConfig.is_primary.desc(), UserConfig.created_at.asc()).all()
         
-        # Проверяем формат UUID (должен содержать дефисы, а не быть email)
-        if '@' in user.remnawave_uuid or '.' in user.remnawave_uuid.split('@')[0] if '@' in user.remnawave_uuid else False:
-            print(f"WARNING: User {user.telegram_id} has invalid remnawave_uuid format (looks like email): {user.remnawave_uuid}")
-            response = jsonify({
-                "detail": {"title": "Error", "message": "Invalid user UUID. Please contact support or re-register."}
-            })
-            response.headers.add('Access-Control-Allow-Origin', '*')
-            return response, 500
+        API_URL = os.getenv('API_URL')
+        headers, cookies = get_remnawave_headers()
         
-        # Получаем данные подписки (subscription URL содержит конфиги)
-        cache_key = f'live_data_{user.remnawave_uuid}'
-        cached = cache.get(cache_key)
-        
-        if not cached:
-            API_URL = os.getenv('API_URL')
-            headers, cookies = get_remnawave_headers()
-            try:
-                resp = requests.get(
-                    f"{API_URL}/api/users/{user.remnawave_uuid}",
-                    headers=headers,
-                    cookies=cookies,
-                    timeout=10
-                )
-                if resp.status_code == 200:
-                    cached = resp.json().get('response', {})
-                    cache.set(cache_key, cached, timeout=300)
-            except:
-                pass
-        
-        subscription_url = cached.get('subscriptionUrl') if cached else None
-        expire_at = cached.get('expireAt') if cached else None
-        has_active = False
-        
-        if expire_at:
-            try:
-                expire_dt = datetime.fromisoformat(expire_at.replace('Z', '+00:00')) if isinstance(expire_at, str) else expire_at
-                has_active = expire_dt > datetime.now(timezone.utc)
-            except:
-                pass
+        # Получаем названия тарифов из брендинга
+        from modules.models.branding import BrandingSetting
+        branding = BrandingSetting.query.first()
+        basic_name = getattr(branding, 'tariff_tier_basic_name', None) or 'Базовый'
+        pro_name = getattr(branding, 'tariff_tier_pro_name', None) or 'Премиум'
+        elite_name = getattr(branding, 'tariff_tier_elite_name', None) or 'Элитный'
         
         configs = []
-        if subscription_url and has_active:
-            # Получаем информацию о текущем тарифе из последнего оплаченного платежа
+        
+        for user_config in user_configs:
+            # Получаем данные из Remna для каждого конфига
+            cache_key = f'live_data_{user_config.remnawave_uuid}'
+            cached = cache.get(cache_key)
+            
+            if not cached:
+                try:
+                    resp = requests.get(
+                        f"{API_URL}/api/users/{user_config.remnawave_uuid}",
+                        headers=headers,
+                        cookies=cookies,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        cached = resp.json().get('response', {})
+                        cache.set(cache_key, cached, timeout=300)
+                except:
+                    cached = {}
+            
+            subscription_url = cached.get('subscriptionUrl') if cached else None
+            expire_at = cached.get('expireAt') if cached else None
+            has_active = False
+            
+            if expire_at:
+                try:
+                    expire_dt = datetime.fromisoformat(expire_at.replace('Z', '+00:00')) if isinstance(expire_at, str) else expire_at
+                    has_active = expire_dt > datetime.now(timezone.utc)
+                except:
+                    pass
+            
+            # Получаем информацию о тарифе из последнего оплаченного платежа для этого конфига
+            # Ищем платежи, связанные с этим remnawave_uuid через user_config_id (если будет добавлено)
+            # Пока используем последний платеж пользователя
             last_payment = Payment.query.filter_by(
                 user_id=user.id,
                 status='PAID'
             ).order_by(Payment.created_at.desc()).first()
             
-            tariff_name = "Основной конфиг"
+            tariff_name = user_config.config_name or (f'Конфиг {user_config.id}' if not user_config.is_primary else 'Основной конфиг')
             tariff_tier = None
             tariff_duration = None
             device_limit = None
             traffic_limit_bytes = None
+            
             if last_payment and last_payment.tariff_id:
                 tariff = db.session.get(Tariff, last_payment.tariff_id)
                 if tariff:
                     tariff_tier = tariff.tier
                     device_limit = tariff.hwid_device_limit if hasattr(tariff, 'hwid_device_limit') else None
                     traffic_limit_bytes = tariff.traffic_limit_bytes if hasattr(tariff, 'traffic_limit_bytes') else None
-                    # Используем tier для отображения (Basic, Pro, Elite), если он есть
-                    # Иначе используем name, но проверяем, не содержит ли он период
+                    
                     if tariff.tier:
                         tier_names = {
-                            'basic': 'Базовый',
-                            'pro': 'Премиум',
-                            'elite': 'Элитный'
+                            'basic': basic_name,
+                            'pro': pro_name,
+                            'elite': elite_name
                         }
                         tariff_name = tier_names.get(tariff.tier.lower(), tariff.tier.capitalize())
                     else:
-                        # Проверяем, содержит ли name период (месяц, дней и т.д.)
-                        period_patterns = [
-                            r'\d+\s*(месяц|месяца|месяцев|Месяц|Месяца|Месяцев)',
-                            r'\d+\s*(день|дня|дней|День|Дня|Дней)',
-                            r'\d+\s*(day|days|Day|Days)',
-                            r'\d+\s*(мес|Мес)'
-                        ]
-                        has_period = any(re.search(pattern, tariff.name or '') for pattern in period_patterns)
-                        if has_period:
-                            # Если name содержит период, определяем tier по duration_days
-                            if tariff.duration_days >= 180:
-                                tariff_tier = 'elite'
-                                tariff_name = 'Элитный'
-                            elif tariff.duration_days >= 90:
-                                tariff_tier = 'pro'
-                                tariff_name = 'Премиум'
-                            else:
-                                tariff_tier = 'basic'
-                                tariff_name = 'Базовый'
-                        else:
-                            tariff_name = tariff.name
+                        tariff_name = tariff.name
                     tariff_duration = tariff.duration_days
             
             configs.append({
-                "id": "main",
+                "id": user_config.id,
+                "config_id": user_config.id,  # Для обратной совместимости
                 "name": tariff_name,
+                "config_name": user_config.config_name or tariff_name,
                 "tier": tariff_tier,
                 "subscription_url": subscription_url,
                 "expire_at": expire_at,
-                "is_active": True,
+                "is_active": has_active,
+                "is_primary": user_config.is_primary,
                 "tariff_duration_days": tariff_duration,
                 "device_limit": device_limit,
-                "traffic_limit_bytes": traffic_limit_bytes
+                "traffic_limit_bytes": traffic_limit_bytes,
+                "remnawave_uuid": user_config.remnawave_uuid
             })
+        
+        # Если у пользователя нет конфигов, но есть старый remnawave_uuid - создаем основной конфиг
+        if not configs and user.remnawave_uuid and '@' not in user.remnawave_uuid:
+            # Создаем основной конфиг для обратной совместимости
+            primary_config = UserConfig.query.filter_by(user_id=user.id, remnawave_uuid=user.remnawave_uuid).first()
+            if not primary_config:
+                primary_config = UserConfig(
+                    user_id=user.id,
+                    remnawave_uuid=user.remnawave_uuid,
+                    config_name='Основной конфиг',
+                    is_primary=True
+                )
+                db.session.add(primary_config)
+                db.session.commit()
+                # Рекурсивно вызываем себя для получения данных
+                return miniapp_configs()
         
         response = jsonify({"configs": configs})
         response.headers.add('Access-Control-Allow-Origin', '*')
@@ -1459,9 +1601,192 @@ def miniapp_configs():
         return response, 500
 
 
-# Примечание: Создание конфига происходит через покупку тарифа
-# Используйте эндпоинт /miniapp/payments/create с параметром tariff_id
-# После успешной оплаты тарифа конфиг будет доступен через subscription URL
+# Эндпоинт /miniapp/configs/create удален
+# Создание конфига теперь происходит только после успешной оплаты тарифа
+# При нажатии "Добавить конфиг" открывается страница тарифов
+
+
+# ============================================================================
+# CONFIGS MANAGEMENT (rename/delete additional configs)
+# ============================================================================
+
+@app.route('/miniapp/configs/rename', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_configs_rename():
+    """Переименовать дополнительный конфиг пользователя."""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+
+    try:
+        data = request.json or {}
+        init_data = data.get('initData') or data.get('init_data') or ''
+        telegram_id, _ = parse_telegram_init_data(init_data)
+
+        if not telegram_id:
+            response = jsonify({"detail": {"title": "Authorization Error", "message": "Missing initData"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 401
+
+        user = User.query.filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            response = jsonify({"detail": {"title": "User Not Found", "message": "User not registered"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        config_id = data.get('config_id') or data.get('configId') or data.get('configID') or data.get('id')
+        try:
+            config_id_int = int(config_id)
+        except Exception:
+            response = jsonify({"detail": {"title": "Bad Request", "message": "Invalid config_id"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+
+        new_name = (data.get('name') or data.get('config_name') or data.get('configName') or '').strip()
+        if not new_name:
+            response = jsonify({"detail": {"title": "Bad Request", "message": "Name is required"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+
+        if len(new_name) > 100:
+            response = jsonify({"detail": {"title": "Bad Request", "message": "Name is too long"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+
+        user_config = UserConfig.query.filter_by(id=config_id_int, user_id=user.id).first()
+        if not user_config:
+            response = jsonify({"detail": {"title": "Not Found", "message": "Config not found"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        if user_config.is_primary:
+            response = jsonify({"detail": {"title": "Forbidden", "message": "Primary config cannot be renamed"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 403
+
+        user_config.config_name = new_name
+        db.session.commit()
+
+        response = jsonify({
+            "message": "Renamed",
+            "config": {
+                "id": user_config.id,
+                "config_id": user_config.id,
+                "config_name": user_config.config_name,
+                "is_primary": user_config.is_primary
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        response = jsonify({"detail": {"title": "Error", "message": str(e)}})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+
+@app.route('/miniapp/configs/delete', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_configs_delete():
+    """Удалить дополнительный конфиг пользователя."""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response
+
+    try:
+        data = request.json or {}
+        init_data = data.get('initData') or data.get('init_data') or ''
+        telegram_id, _ = parse_telegram_init_data(init_data)
+
+        if not telegram_id:
+            response = jsonify({"detail": {"title": "Authorization Error", "message": "Missing initData"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 401
+
+        user = User.query.filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            response = jsonify({"detail": {"title": "User Not Found", "message": "User not registered"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        config_id = data.get('config_id') or data.get('configId') or data.get('configID') or data.get('id')
+        try:
+            config_id_int = int(config_id)
+        except Exception:
+            response = jsonify({"detail": {"title": "Bad Request", "message": "Invalid config_id"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+
+        user_config = UserConfig.query.filter_by(id=config_id_int, user_id=user.id).first()
+        if not user_config:
+            response = jsonify({"detail": {"title": "Not Found", "message": "Config not found"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        if user_config.is_primary:
+            response = jsonify({"detail": {"title": "Forbidden", "message": "Primary config cannot be deleted"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 403
+
+        remnawave_uuid = user_config.remnawave_uuid
+
+        # Убираем ссылки из платежей, чтобы не упереться в FK constraint
+        try:
+            Payment.query.filter_by(user_config_id=user_config.id).update(
+                {Payment.user_config_id: None},
+                synchronize_session=False
+            )
+        except Exception:
+            pass
+
+        # Чистим кеши по этому UUID
+        if remnawave_uuid:
+            cache.delete(f'live_data_{remnawave_uuid}')
+            cache.delete(f'nodes_{remnawave_uuid}')
+
+        # Пытаемся удалить пользователя в RemnaWave (не блокируем удаление в БД при ошибке)
+        remote_deleted = False
+        remote_status = None
+        API_URL = os.getenv('API_URL')
+        if API_URL and remnawave_uuid:
+            try:
+                headers, cookies = get_remnawave_headers()
+                resp = requests.delete(
+                    f"{API_URL}/api/users/{remnawave_uuid}",
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=10
+                )
+                remote_status = resp.status_code
+                remote_deleted = resp.status_code in [200, 204]
+            except Exception:
+                remote_status = None
+
+        db.session.delete(user_config)
+        db.session.commit()
+
+        response = jsonify({
+            "message": "Deleted",
+            "remote_deleted": remote_deleted,
+            "remote_status": remote_status
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        response = jsonify({"detail": {"title": "Error", "message": str(e)}})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
 
 
 # ============================================================================
@@ -1515,7 +1840,8 @@ def miniapp_referrals_info():
         ref_settings = get_referral_settings()
         referral_type = getattr(ref_settings, 'referral_type', 'DAYS') if ref_settings else 'DAYS'
         default_referral_percent = getattr(ref_settings, 'default_referral_percent', 10.0) if ref_settings else 10.0
-        user_referral_percent = user.referral_percent if user.referral_percent else default_referral_percent
+        # Если у пользователя установлен индивидуальный процент - используем его, иначе глобальный
+        user_referral_percent = user.referral_percent if user.referral_percent is not None else default_referral_percent
         
         # Информация в зависимости от типа системы
         referral_info = {}
@@ -2268,6 +2594,13 @@ def miniapp_payments_history():
             response.headers.add('Access-Control-Allow-Origin', '*')
             return response, 404
         
+        # Получаем названия тарифов из брендинга
+        from modules.models.branding import BrandingSetting
+        branding = BrandingSetting.query.first()
+        basic_name = getattr(branding, 'tariff_tier_basic_name', None) or 'Базовый'
+        pro_name = getattr(branding, 'tariff_tier_pro_name', None) or 'Премиум'
+        elite_name = getattr(branding, 'tariff_tier_elite_name', None) or 'Элитный'
+        
         # Получаем платежи пользователя
         payments = Payment.query.filter_by(user_id=user.id).order_by(Payment.created_at.desc()).limit(50).all()
         
@@ -2279,9 +2612,9 @@ def miniapp_payments_history():
                 # Используем tier для отображения (Basic, Pro, Elite), если он есть
                 if tariff.tier:
                     tier_names = {
-                        'basic': 'Базовый',
-                        'pro': 'Премиум',
-                        'elite': 'Элитный'
+                        'basic': basic_name,
+                        'pro': pro_name,
+                        'elite': elite_name
                     }
                     tariff_name = tier_names.get(tariff.tier.lower(), tariff.tier.capitalize())
                 else:
@@ -2296,11 +2629,11 @@ def miniapp_payments_history():
                     if has_period:
                         # Если name содержит период, определяем tier по duration_days
                         if tariff.duration_days >= 180:
-                            tariff_name = 'Элитный'
+                            tariff_name = elite_name
                         elif tariff.duration_days >= 90:
-                            tariff_name = 'Премиум'
+                            tariff_name = pro_name
                         else:
-                            tariff_name = 'Базовый'
+                            tariff_name = basic_name
                     else:
                         tariff_name = tariff.name
             
@@ -2324,5 +2657,396 @@ def miniapp_payments_history():
         import traceback
         traceback.print_exc()
         response = jsonify({"payments": []})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+
+# ============================================================================
+# КАЗИНО (Колесо Фортуны)
+# ============================================================================
+
+import random
+from modules.models.casino import CasinoGame, CasinoStats
+
+def get_casino_config():
+    """Получить конфигурацию казино из ENV"""
+    return {
+        'enabled': os.environ.get('CASINO_ENABLED', 'false').lower() == 'true',
+        'min_bet': int(os.environ.get('CASINO_MIN_BET', '1')),
+        'max_bet': int(os.environ.get('CASINO_MAX_BET', '30')),
+        'max_games_per_day': int(os.environ.get('CASINO_MAX_GAMES_PER_DAY', '10')),
+        'chances': {
+            0: int(os.environ.get('CASINO_CHANCE_X0', '40')),
+            0.5: int(os.environ.get('CASINO_CHANCE_X05', '15')),
+            1: int(os.environ.get('CASINO_CHANCE_X1', '15')),
+            1.5: int(os.environ.get('CASINO_CHANCE_X15', '12')),
+            2: int(os.environ.get('CASINO_CHANCE_X2', '10')),
+            3: int(os.environ.get('CASINO_CHANCE_X3', '5')),
+            5: int(os.environ.get('CASINO_CHANCE_X5', '3')),
+        }
+    }
+
+
+def spin_wheel(chances):
+    """Крутит колесо и возвращает множитель"""
+    # Создаём список секторов с учётом шансов
+    sectors = []
+    for multiplier, chance in chances.items():
+        sectors.extend([multiplier] * chance)
+    
+    # Перемешиваем и выбираем случайный
+    random.shuffle(sectors)
+    return random.choice(sectors)
+
+
+def get_user_days_remaining(user):
+    """Получить количество оставшихся дней подписки"""
+    if not user or not user.remnawave_uuid:
+        return 0
+    
+    try:
+        api_url = os.environ.get('API_URL', '')
+        admin_token = os.environ.get('ADMIN_TOKEN', '')
+        
+        response = requests.get(
+            f"{api_url}/api/users/{user.remnawave_uuid}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json().get('response', {})
+            expire_at = data.get('expireAt')
+            if expire_at:
+                expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
+                now = datetime.now(timezone.utc)
+                days = (expire_date - now).days
+                return max(0, days)
+    except:
+        pass
+    
+    return 0
+
+
+def update_user_subscription(user, days_delta):
+    """Обновить подписку пользователя (добавить/убавить дни)"""
+    if not user or not user.remnawave_uuid:
+        return False
+    
+    try:
+        api_url = os.environ.get('API_URL', '')
+        admin_token = os.environ.get('ADMIN_TOKEN', '')
+        
+        # Получаем текущую дату окончания
+        response = requests.get(
+            f"{api_url}/api/users/{user.remnawave_uuid}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            return False
+        
+        data = response.json().get('response', {})
+        current_expire = data.get('expireAt')
+        
+        if current_expire:
+            expire_date = datetime.fromisoformat(current_expire.replace('Z', '+00:00'))
+        else:
+            expire_date = datetime.now(timezone.utc)
+        
+        # Добавляем/убавляем дни
+        new_expire = expire_date + timedelta(days=days_delta)
+        
+        # Обновляем через API (правильный формат - uuid в теле запроса)
+        update_response = requests.patch(
+            f"{api_url}/api/users",
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json"
+            },
+            json={"uuid": user.remnawave_uuid, "expireAt": new_expire.isoformat()},
+            timeout=10
+        )
+        
+        if update_response.status_code != 200:
+            print(f"Error updating subscription: Status {update_response.status_code}, Response: {update_response.text[:200]}")
+        
+        return update_response.status_code == 200
+    except Exception as e:
+        print(f"Error updating subscription: {e}")
+        return False
+
+
+@app.route('/miniapp/casino/config', methods=['GET', 'POST', 'OPTIONS'])
+def casino_config():
+    """Получить конфигурацию казино"""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', '*')
+        response.headers.add('Access-Control-Allow-Methods', '*')
+        return response, 200
+    
+    config = get_casino_config()
+    
+    # Преобразуем шансы в массив для фронтенда
+    wheel_sectors = [
+        {'multiplier': 0, 'label': 'x0', 'color': '#ff4444', 'chance': config['chances'][0]},
+        {'multiplier': 0.5, 'label': 'x0.5', 'color': '#ff8844', 'chance': config['chances'][0.5]},
+        {'multiplier': 1, 'label': 'x1', 'color': '#ffbb44', 'chance': config['chances'][1]},
+        {'multiplier': 1.5, 'label': 'x1.5', 'color': '#88cc44', 'chance': config['chances'][1.5]},
+        {'multiplier': 2, 'label': 'x2', 'color': '#44cc88', 'chance': config['chances'][2]},
+        {'multiplier': 3, 'label': 'x3', 'color': '#44aacc', 'chance': config['chances'][3]},
+        {'multiplier': 5, 'label': 'x5', 'color': '#aa44cc', 'chance': config['chances'][5]},
+    ]
+    
+    response = jsonify({
+        'enabled': config['enabled'],
+        'min_bet': config['min_bet'],
+        'max_bet': config['max_bet'],
+        'max_games_per_day': config['max_games_per_day'],
+        'wheel_sectors': wheel_sectors
+    })
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    return response, 200
+
+
+@app.route('/miniapp/casino/play', methods=['POST', 'OPTIONS'])
+def casino_play():
+    """Играть в казино"""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', '*')
+        response.headers.add('Access-Control-Allow-Methods', '*')
+        return response, 200
+    
+    config = get_casino_config()
+    
+    if not config['enabled']:
+        response = jsonify({'error': 'Казино отключено'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 400
+    
+    try:
+        data = request.json or {}
+        init_data = data.get('initData', '')
+        bet_days = int(data.get('bet', 1))
+        
+        # Парсим данные пользователя
+        telegram_id, user_data = parse_telegram_init_data(init_data)
+        
+        if not telegram_id:
+            response = jsonify({'error': 'Не авторизован'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 401
+        
+        # Находим пользователя
+        user = User.query.filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            response = jsonify({'error': 'Пользователь не найден'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+        
+        # Проверяем ставку
+        if bet_days < config['min_bet'] or bet_days > config['max_bet']:
+            response = jsonify({'error': f'Ставка должна быть от {config["min_bet"]} до {config["max_bet"]} дней'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+        
+        # Проверяем лимит игр в день
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        games_today = CasinoGame.query.filter(
+            CasinoGame.user_id == user.id,
+            CasinoGame.created_at >= today_start
+        ).count()
+        
+        if games_today >= config['max_games_per_day']:
+            response = jsonify({'error': f'Лимит игр на сегодня исчерпан ({config["max_games_per_day"]} игр)'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+        
+        # Проверяем баланс дней
+        days_remaining = get_user_days_remaining(user)
+        
+        if days_remaining < bet_days:
+            response = jsonify({'error': f'Недостаточно дней для ставки. У вас {days_remaining} дней'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+        
+        # Сначала списываем ставку
+        balance_before = days_remaining
+        success = update_user_subscription(user, -bet_days)
+        if not success:
+            response = jsonify({'error': 'Ошибка списания ставки'})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 500
+        
+        # Крутим колесо
+        multiplier = spin_wheel(config['chances'])
+        
+        # Рассчитываем выигрыш
+        # Множитель показывает, сколько дней получаем за ставку
+        # Например, x5 означает, что за 1 день ставки получаем 5 дней
+        # Ставка уже списана, поэтому просто добавляем выигрыш
+        if multiplier == 0:
+            win_days = 0  # Потеря ставки (получаем 0, ставка уже списана)
+        else:
+            # Получаем bet_days * multiplier дней
+            win_days = int(bet_days * multiplier)
+        
+        # Добавляем выигрыш (если есть)
+        if win_days > 0:
+            success = update_user_subscription(user, win_days)
+            if not success:
+                response = jsonify({'error': 'Ошибка начисления выигрыша'})
+                response.headers.add('Access-Control-Allow-Origin', '*')
+                return response, 500
+        
+        # Получаем финальный баланс
+        days_remaining_after = get_user_days_remaining(user)
+        balance_after = days_remaining_after
+        
+        # Чистый выигрыш/проигрыш для статистики
+        net_win_days = win_days - bet_days
+        
+        # Логируем для отладки
+        print(f"Casino: bet={bet_days}, multiplier={multiplier}, win_days={win_days}, net_win={net_win_days}, balance_before={balance_before}, balance_after={balance_after}")
+        
+        # Сохраняем игру в историю
+        game = CasinoGame(
+            user_id=user.id,
+            bet_days=bet_days,
+            multiplier=multiplier,
+            win_days=net_win_days,  # Чистый выигрыш/проигрыш для статистики
+            balance_before=balance_before,
+            balance_after=balance_after
+        )
+        db.session.add(game)
+        
+        # Обновляем статистику казино
+        stats = CasinoStats.query.first()
+        if not stats:
+            stats = CasinoStats(
+                total_games=0,
+                total_bet_days=0,
+                total_win_days=0,
+                total_lost_days=0,
+                house_profit_days=0
+            )
+            db.session.add(stats)
+        
+        # Инициализируем None значения
+        if stats.total_games is None:
+            stats.total_games = 0
+        if stats.total_bet_days is None:
+            stats.total_bet_days = 0
+        if stats.total_win_days is None:
+            stats.total_win_days = 0
+        if stats.total_lost_days is None:
+            stats.total_lost_days = 0
+        
+        stats.total_games += 1
+        stats.total_bet_days += bet_days
+        
+        if net_win_days > 0:
+            stats.total_win_days += net_win_days
+        else:
+            stats.total_lost_days += abs(net_win_days)
+        
+        stats.house_profit_days = stats.total_lost_days - stats.total_win_days
+        
+        db.session.commit()
+        
+        # Определяем результат
+        if multiplier == 0:
+            result_text = 'Вы проиграли!'
+            result_type = 'lose'
+        elif multiplier == 1:
+            result_text = 'Ставка возвращена'
+            result_type = 'neutral'
+        elif multiplier < 1:
+            result_text = 'Частичный возврат'
+            result_type = 'partial'
+        else:
+            result_text = 'Вы выиграли!'
+            result_type = 'win'
+        
+        response = jsonify({
+            'success': True,
+            'multiplier': multiplier,
+            'bet_days': bet_days,
+            'win_days': win_days,  # Количество дней, которое было добавлено
+            'net_win_days': net_win_days,  # Чистый выигрыш/проигрыш (выигрыш - ставка)
+            'balance_before': balance_before,
+            'balance_after': balance_after,
+            'result_text': result_text,
+            'result_type': result_type,
+            'games_remaining_today': config['max_games_per_day'] - games_today - 1
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        response = jsonify({'error': str(e)})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+
+@app.route('/miniapp/casino/history', methods=['GET', 'POST', 'OPTIONS'])
+def casino_history():
+    """Получить историю игр пользователя"""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', '*')
+        response.headers.add('Access-Control-Allow-Methods', '*')
+        return response, 200
+    
+    try:
+        data = request.json or {}
+        init_data = data.get('initData', '')
+        
+        telegram_id, _ = parse_telegram_init_data(init_data)
+        
+        if not telegram_id:
+            response = jsonify({'games': []})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 200
+        
+        user = User.query.filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            response = jsonify({'games': []})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 200
+        
+        # Последние 20 игр
+        games = CasinoGame.query.filter_by(user_id=user.id).order_by(
+            CasinoGame.created_at.desc()
+        ).limit(20).all()
+        
+        # Статистика пользователя
+        total_games = CasinoGame.query.filter_by(user_id=user.id).count()
+        total_bet = db.session.query(db.func.sum(CasinoGame.bet_days)).filter_by(user_id=user.id).scalar() or 0
+        total_win = db.session.query(db.func.sum(CasinoGame.win_days)).filter_by(user_id=user.id).scalar() or 0
+        
+        response = jsonify({
+            'games': [g.to_dict() for g in games],
+            'stats': {
+                'total_games': total_games,
+                'total_bet': total_bet,
+                'total_profit': total_win  # Может быть отрицательным
+            }
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        response = jsonify({'games': [], 'stats': {}})
         response.headers.add('Access-Control-Allow-Origin', '*')
         return response, 200

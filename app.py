@@ -46,7 +46,10 @@ from modules.models.bot_config import BotConfig
 from modules.models.referral import ReferralSetting
 from modules.models.currency import CurrencyRate
 from modules.models.tariff_feature import TariffFeatureSetting
-from modules.models.auto_broadcast import AutoBroadcastMessage
+from modules.models.auto_broadcast import AutoBroadcastMessage, AutoBroadcastSettings
+from modules.models.casino import CasinoGame, CasinoStats
+from modules.models.trial import TrialSettings
+from modules.models.user_config import UserConfig
 
 # ============================================================================
 # ИМПОРТ API МАРШРУТОВ
@@ -65,10 +68,8 @@ from modules.api.bot import routes as bot_routes
 # ADMIN PANEL - Отдача статических файлов админки
 # ============================================================================
 
-@app.route('/payment-success.html')
-def payment_success():
-    """Страница успешной оплаты с автоматическим редиректом в Telegram"""
-    # Пробуем найти payment-success.html в разных местах
+def _serve_payment_success():
+    """Вспомогательная функция для отдачи payment-success.html"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     possible_paths = [
         # Docker путь (приоритет)
@@ -103,6 +104,16 @@ def payment_success():
     
     # Если не найдено, возвращаем 404
     return jsonify({"error": "payment-success.html not found"}), 404
+
+@app.route('/payment-success.html')
+def payment_success():
+    """Страница успешной оплаты с автоматическим редиректом в Telegram"""
+    return _serve_payment_success()
+
+@app.route('/miniapp/payment-success.html')
+def miniapp_payment_success():
+    """Страница успешной оплаты для старого мини-аппа (обратная совместимость)"""
+    return _serve_payment_success()
 
 @app.route('/miniapp-v2/', defaults={'path': ''}, methods=['GET', 'HEAD', 'POST', 'OPTIONS'])
 @app.route('/miniapp-v2/<path:path>', methods=['GET', 'HEAD', 'POST', 'OPTIONS'])
@@ -314,6 +325,102 @@ def serve_admin_panel(path):
     return send_from_directory(admin_panel_dir, 'index.html')
 
 # ============================================================================
+# ПЛАНИРОВЩИК АВТОМАТИЧЕСКОЙ РАССЫЛКИ
+# ============================================================================
+
+# Глобальная переменная для планировщика
+_scheduler = None
+
+def get_broadcast_settings():
+    """Получить настройки автоматической рассылки из БД или переменных окружения"""
+    try:
+        with app.app_context():
+            from modules.models.auto_broadcast import AutoBroadcastSettings
+            settings = AutoBroadcastSettings.query.first()
+            if settings:
+                return {
+                    'enabled': settings.enabled,
+                    'hours': settings.hours
+                }
+    except Exception as e:
+        print(f"Warning: Could not load settings from DB: {e}")
+    
+    # Fallback на переменные окружения
+    return {
+        'enabled': os.getenv('AUTO_BROADCAST_ENABLED', 'true').lower() == 'true',
+        'hours': os.getenv('AUTO_BROADCAST_HOURS', '9,14,19')
+    }
+
+def run_auto_broadcasts_job():
+    """Задача для автоматической рассылки"""
+    try:
+        with app.app_context():
+            from send_auto_broadcasts import send_auto_broadcasts
+            app.logger.info("📬 Запуск автоматической рассылки...")
+            send_auto_broadcasts()
+            app.logger.info("✅ Автоматическая рассылка завершена")
+    except Exception as e:
+        app.logger.error(f"❌ Ошибка автоматической рассылки: {e}")
+
+def start_scheduler():
+    """Запустить планировщик автоматической рассылки"""
+    global _scheduler
+    
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        import atexit
+        
+        settings = get_broadcast_settings()
+        
+        if not settings['enabled']:
+            app.logger.info("📅 Автоматическая рассылка отключена")
+            return
+        
+        _scheduler = BackgroundScheduler(daemon=True)
+        
+        # Парсим часы
+        hours = [int(h.strip()) for h in settings['hours'].split(',')]
+        
+        for hour in hours:
+            _scheduler.add_job(
+                func=run_auto_broadcasts_job,
+                trigger=CronTrigger(hour=hour, minute=0),
+                id=f'auto_broadcast_{hour}',
+                name=f'Auto Broadcast at {hour}:00',
+                replace_existing=True
+            )
+        
+        _scheduler.start()
+        app.logger.info(f"📅 Планировщик автоматической рассылки запущен: {settings['hours']}:00")
+        
+        # Останавливаем планировщик при выходе
+        atexit.register(lambda: _scheduler.shutdown() if _scheduler else None)
+        
+    except ImportError:
+        app.logger.warning("⚠️  APScheduler не установлен. Автоматическая рассылка недоступна.")
+    except Exception as e:
+        app.logger.warning(f"⚠️  Ошибка запуска планировщика: {e}")
+
+def restart_scheduler():
+    """Перезапустить планировщик с новыми настройками"""
+    global _scheduler
+    
+    try:
+        # Останавливаем текущий планировщик
+        if _scheduler:
+            _scheduler.shutdown(wait=False)
+            _scheduler = None
+            app.logger.info("📅 Планировщик остановлен для перезапуска")
+        
+        # Запускаем с новыми настройками
+        start_scheduler()
+        
+    except Exception as e:
+        app.logger.error(f"❌ Ошибка перезапуска планировщика: {e}")
+
+
+# ============================================================================
 
 if __name__ == '__main__':
     import logging
@@ -399,36 +506,82 @@ if __name__ == '__main__':
         # Создаем таблицы в базе данных
         db.create_all()
         
+        # Создаем настройки триала если их нет
+        try:
+            trial_settings = TrialSettings.query.first()
+            if not trial_settings:
+                app.logger.info("📋 Создание настроек триала по умолчанию...")
+                default_settings = TrialSettings(
+                    days=3,
+                    devices=3,
+                    traffic_limit_bytes=0,
+                    enabled=True,
+                    title_ru='Получите {days} дней премиум',
+                    title_ua='Отримайте {days} днів преміум',
+                    title_en='Get {days} Days Premium',
+                    title_cn='获得 {days} 天高级版',
+                    description_ru='Дадим полный доступ без ограничений — протестируйте сеть перед оплатой.',
+                    description_ua='Дамо повний доступ без обмежень — протестуйте мережу перед оплатою.',
+                    description_en='We\'ll give you full access without restrictions — test the network before payment.',
+                    description_cn='我们将为您提供无限制的完全访问权限 — 在付款前测试网络。',
+                    button_text_ru='🎁 Попробовать бесплатно ({days} дня)',
+                    button_text_ua='🎁 Спробувати безкоштовно ({days} дні)',
+                    button_text_en='🎁 Try Free ({days} Days)',
+                    button_text_cn='🎁 免费试用 ({days} 天)',
+                    activation_message_ru='✅ Триал активирован! Вам добавлено {days} дней премиум-доступа.',
+                    activation_message_ua='✅ Тріал активовано! Вам додано {days} днів преміум-доступу.',
+                    activation_message_en='✅ Trial activated! You have been added {days} days of premium access.',
+                    activation_message_cn='✅ 试用已激活！您已获得 {days} 天的高级访问权限。'
+                )
+                db.session.add(default_settings)
+                db.session.commit()
+                app.logger.info("✅ Настройки триала созданы")
+        except Exception as e:
+            app.logger.warning(f"⚠️  Ошибка при создании настроек триала: {e}")
+        
         # Создаем дефолтные сообщения автоматических рассылок если их нет
         try:
             from modules.models.auto_broadcast import AutoBroadcastMessage
-            subscription_msg = AutoBroadcastMessage.query.filter_by(
-                message_type='subscription_expiring_3days'
-            ).first()
             
-            if not subscription_msg:
-                subscription_msg = AutoBroadcastMessage(
-                    message_type='subscription_expiring_3days',
-                    message_text='Подписка заканчивается через 3 дня, не забудьте продлить',
-                    enabled=True,
-                    bot_type='both'
-                )
-                db.session.add(subscription_msg)
-                app.logger.info("✅ Создано сообщение: subscription_expiring_3days")
+            default_messages = {
+                'subscription_expiring_3days': {
+                    'text': 'Подписка заканчивается через 3 дня, не забудьте продлить',
+                    'enabled': True,
+                    'bot_type': 'both'
+                },
+                'trial_expiring': {
+                    'text': 'Тестовый период заканчивается, не желаете купить подписку?',
+                    'enabled': True,
+                    'bot_type': 'both'
+                },
+                'no_subscription': {
+                    'text': '🔔 Вы ещё не оформили VPN? Не теряйте время — подключитесь сейчас и защитите свой трафик!',
+                    'enabled': True,
+                    'bot_type': 'both'
+                },
+                'trial_not_used': {
+                    'text': '🚀 Бесплатная пробная подписка ждёт вас!\n\nМы заметили, что вы ещё не воспользовались пробным доступом. Активируйте его прямо сейчас и оцените все преимущества VPN! 🔥',
+                    'enabled': True,
+                    'bot_type': 'both'
+                },
+                'trial_active': {
+                    'text': '🎉 Ваш пробный доступ ещё активен!\n\nНе упустите возможность протестировать VPN бесплатно! Никаких обязательств — просто подключитесь и наслаждайтесь безопасным интернетом. 🌍',
+                    'enabled': True,
+                    'bot_type': 'both'
+                }
+            }
             
-            trial_msg = AutoBroadcastMessage.query.filter_by(
-                message_type='trial_expiring'
-            ).first()
-            
-            if not trial_msg:
-                trial_msg = AutoBroadcastMessage(
-                    message_type='trial_expiring',
-                    message_text='Тестовый период заканчивается, не желаете купить подписку?',
-                    enabled=True,
-                    bot_type='both'
-                )
-                db.session.add(trial_msg)
-                app.logger.info("✅ Создано сообщение: trial_expiring")
+            for msg_type, msg_data in default_messages.items():
+                existing_msg = AutoBroadcastMessage.query.filter_by(message_type=msg_type).first()
+                if not existing_msg:
+                    new_msg = AutoBroadcastMessage(
+                        message_type=msg_type,
+                        message_text=msg_data['text'],
+                        enabled=msg_data['enabled'],
+                        bot_type=msg_data['bot_type']
+                    )
+                    db.session.add(new_msg)
+                    app.logger.info(f"✅ Создано сообщение: {msg_type}")
             
             db.session.commit()
         except Exception as e:
@@ -456,6 +609,9 @@ if __name__ == '__main__':
         app.logger.info("StealthNET API Starting...")
         app.logger.info(f"Registered {len(list(app.url_map.iter_rules()))} endpoints")
         app.logger.info("=" * 60)
+        
+        # Запускаем планировщик автоматических рассылок
+        start_scheduler()
 
     # Запускаем приложение
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)

@@ -26,6 +26,11 @@ class PaymentSetting(db.Model):
     yookassa_shop_id = db.Column(db.Text, nullable=True)
     yookassa_secret_key = db.Column(db.Text, nullable=True)
     yookassa_receipt_required = db.Column(db.Boolean, default=False, nullable=False)  # Требовать receipt (чек) при создании платежа
+
+    # YooMoney (wallet / payment buttons)
+    # Используется Quickpay форма + HTTP-уведомления (sha1_hash) для подтверждения оплаты
+    yoomoney_receiver = db.Column(db.Text, nullable=True)  # номер кошелька (receiver)
+    yoomoney_notification_secret = db.Column(db.Text, nullable=True)  # секретное слово для проверки sha1_hash
     
     # CryptoBot
     cryptobot_api_key = db.Column(db.Text, nullable=True)
@@ -33,6 +38,7 @@ class PaymentSetting(db.Model):
     # Platega
     platega_api_key = db.Column(db.Text, nullable=True)
     platega_merchant_id = db.Column(db.Text, nullable=True)
+    platega_mir_enabled = db.Column(db.Boolean, default=False, nullable=False)  # Включить метод "Карты МИР" (paymentMethod=11)
     
     # MulenPay
     mulenpay_api_key = db.Column(db.Text, nullable=True)
@@ -80,6 +86,8 @@ class Payment(db.Model):
     payment_provider = db.Column(db.String(20), nullable=True, default='crystalpay')
     promo_code_id = db.Column(db.Integer, db.ForeignKey('promo_code.id'), nullable=True)
     telegram_message_id = db.Column(db.Integer, nullable=True)  # ID сообщения в Telegram боте о создании платежа
+    user_config_id = db.Column(db.Integer, db.ForeignKey('user_config.id'), nullable=True)  # Конфиг, для которого создан платеж
+    create_new_config = db.Column(db.Boolean, default=False, nullable=False)  # Флаг создания нового конфига после оплаты
 
 
 def decrypt_key(key):

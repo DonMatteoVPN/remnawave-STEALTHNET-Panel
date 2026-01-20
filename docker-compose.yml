@@ -8,15 +8,17 @@ services:
       POSTGRES_DB: ${DB_NAME:-stealthnet}
       POSTGRES_USER: ${DB_USER:-stealthnet}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-stealthnet_password_change_me}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # Не открываем порт наружу для безопасности (только внутри Docker сети)
+    # ports:
+    #   - "5432:5432"
     networks:
       - stealthnet-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-stealthnet}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-stealthnet} -d ${DB_NAME:-stealthnet}"]
       interval: 10s
       timeout: 5s
       retries: 5

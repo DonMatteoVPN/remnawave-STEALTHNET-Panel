@@ -3,6 +3,7 @@ API вебхуков платежных систем
 
 - POST /api/webhook/heleket - Heleket webhook
 - POST /api/webhook/yookassa - YooKassa webhook
+- POST /api/webhook/yoomoney - YooMoney webhook (payment buttons / quickpay notifications)
 - POST /api/webhook/telegram - Telegram Stars webhook
 - POST /api/webhook/telegram-stars - Telegram Stars webhook (alt)
 - POST /api/webhook/freekassa - FreeKassa webhook
@@ -15,6 +16,7 @@ import requests
 import json
 import os
 import threading
+import hashlib
 
 from modules.core import get_app, get_db, get_cache, get_fernet
 from modules.models.payment import Payment, PaymentSetting
@@ -60,7 +62,8 @@ def add_referral_commission(user, amount_usd, is_tariff_purchase=True):
             return
         
         # Получаем процент реферала (индивидуальный или дефолтный)
-        referral_percent = referrer.referral_percent if referrer.referral_percent else referral_settings.default_referral_percent
+        # Если у реферера установлен индивидуальный процент - используем его, иначе глобальный
+        referral_percent = referrer.referral_percent if referrer.referral_percent is not None else referral_settings.default_referral_percent
         
         # Вычисляем комиссию
         commission_usd = (amount_usd * referral_percent) / 100.0
@@ -130,9 +133,163 @@ def process_successful_payment(payment, user, tariff):
     headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
     
     try:
-        resp = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers=headers)
+        # Если нужно создать новый конфиг, создаем его перед обработкой платежа
+        if hasattr(payment, 'create_new_config') and payment.create_new_config:
+            from modules.models.user_config import UserConfig
+            
+            # Генерируем уникальный username для нового аккаунта
+            base_username = None
+            if user.email:
+                base_username = user.email.replace("@", "_").replace(".", "_")
+            else:
+                base_username = f"tg_{user.telegram_id}"
+            
+            # Находим все существующие конфиги пользователя
+            existing_configs = UserConfig.query.filter_by(user_id=user.id).all()
+            existing_usernames = set()
+            existing_emails = set()
+            
+            # Пытаемся получить username из Remna для существующих конфигов
+            for config in existing_configs:
+                try:
+                    resp = requests.get(
+                        f"{API_URL}/api/users/{config.remnawave_uuid}",
+                        headers=headers,
+                        timeout=5
+                    )
+                    if resp.status_code == 200:
+                        user_data = resp.json().get('response', {})
+                        username = user_data.get('username')
+                        if username:
+                            existing_usernames.add(username)
+                        email = user_data.get('email')
+                        if email:
+                            try:
+                                existing_emails.add(str(email).strip().lower())
+                            except Exception:
+                                pass
+                except:
+                    pass
+            
+            # Генерируем уникальный username
+            new_username = base_username
+            suffix_num = 1
+            while new_username in existing_usernames:
+                new_username = f"{base_username}_{suffix_num}"
+                suffix_num += 1
+                if suffix_num > 100:
+                    import random
+                    import string
+                    random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+                    new_username = f"{base_username}_{random_suffix}"
+                    break
+            
+            # Генерируем email и пароль
+            # ВАЖНО: email должен быть уникальным между конфигами.
+            # Если использовать один и тот же email для нескольких Remna-аккаунтов, админка (и любая логика поиска по email)
+            # начинает путаться, а UUID у пользователя может "прыгать" между конфигами → ломаются оплаты/уведомления.
+            cfg_idx = len(existing_configs) + 1
+            if user.email and "@" in user.email:
+                local_part, domain_part = user.email.split("@", 1)
+                candidate = f"{local_part}+cfg{cfg_idx}@{domain_part}"
+            else:
+                candidate = f"tg_{user.telegram_id}_cfg{cfg_idx}@telegram.local"
+
+            candidate_norm = candidate.strip().lower()
+            email_suffix = 1
+            while candidate_norm in existing_emails:
+                if user.email and "@" in user.email:
+                    local_part, domain_part = user.email.split("@", 1)
+                    candidate = f"{local_part}+cfg{cfg_idx}_{email_suffix}@{domain_part}"
+                else:
+                    candidate = f"tg_{user.telegram_id}_cfg{cfg_idx}_{email_suffix}@telegram.local"
+                candidate_norm = candidate.strip().lower()
+                email_suffix += 1
+                if email_suffix > 100:
+                    break
+
+            new_email = candidate
+            import random
+            import string
+            new_password = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+            
+            # Создаем новый аккаунт в Remna
+            expire_date = datetime.now(timezone.utc).isoformat()
+            payload_create = {
+                "email": new_email,
+                "password": new_password,
+                "username": new_username,
+                "expireAt": expire_date
+            }
+            
+            # Добавляем telegramId если есть
+            if user.telegram_id:
+                try:
+                    telegram_id_int = int(user.telegram_id) if isinstance(user.telegram_id, (str, int)) else user.telegram_id
+                    payload_create["telegramId"] = telegram_id_int
+                except (ValueError, TypeError):
+                    payload_create["telegramId"] = str(user.telegram_id)
+            
+            create_resp = requests.post(
+                f"{API_URL}/api/users",
+                headers=headers,
+                json=payload_create,
+                timeout=30
+            )
+            
+            if create_resp.status_code not in [200, 201]:
+                print(f"Failed to create new Remna account: {create_resp.status_code}")
+                return False
+            
+            remnawave_uuid = create_resp.json().get('response', {}).get('uuid')
+            if not remnawave_uuid:
+                print("Failed to get UUID from newly created Remna account")
+                return False
+            
+            # Создаем UserConfig
+            config_name = f'Конфиг {len(existing_configs) + 1}'
+            new_config = UserConfig(
+                user_id=user.id,
+                remnawave_uuid=remnawave_uuid,
+                config_name=config_name,
+                is_primary=False
+            )
+            db.session.add(new_config)
+            db.session.flush()
+            
+            # Обновляем payment с user_config_id
+            payment.user_config_id = new_config.id
+            db.session.commit()
+            
+            print(f"✅ Создан новый конфиг {new_config.id} для пользователя {user.id} после оплаты")
+        else:
+            # Определяем, какой конфиг обновлять.
+            # Правило: если у платежа нет user_config_id — обновляем основной конфиг (is_primary=True),
+            # чтобы бот/сайт (которые по умолчанию работают с основным) всегда видели результат оплаты.
+            remnawave_uuid = user.remnawave_uuid
+            primary_config = None
+            try:
+                from modules.models.user_config import UserConfig
+                primary_config = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+                if primary_config and primary_config.remnawave_uuid:
+                    remnawave_uuid = primary_config.remnawave_uuid
+            except Exception as e:
+                print(f"Warning: failed to resolve primary config for user {user.id}: {e}")
+            
+            # Если указан user_config_id, используем его (поверх primary)
+            if payment.user_config_id:
+                from modules.models.user_config import UserConfig
+                user_config = db.session.get(UserConfig, payment.user_config_id)
+                if user_config and user_config.user_id == user.id:
+                    remnawave_uuid = user_config.remnawave_uuid
+                else:
+                    print(f"Warning: user_config_id {payment.user_config_id} not found or doesn't belong to user {user.id}, using primary config")
+        
+        resp = requests.get(f"{API_URL}/api/users/{remnawave_uuid}", headers=headers)
         if resp.status_code != 200:
-            print(f"Failed to get user data: {resp.status_code}")
+            print(
+                f"Failed to get user data: {resp.status_code} (uuid={remnawave_uuid}, payment={getattr(payment,'order_id',None)}, user_id={getattr(user,'id',None)})"
+            )
             return False
             
         user_data = resp.json().get('response', {})
@@ -161,15 +318,19 @@ def process_successful_payment(payment, user, tariff):
             except:
                 squad_ids = []
         
-        # Если сквады не указаны, используем дефолтный
+        # Если сквады не указаны, используем дефолтный/текущие
         if not squad_ids:
             if tariff.squad_id:
                 squad_ids = [tariff.squad_id]
             else:
-                squad_ids = [DEFAULT_SQUAD_ID] if DEFAULT_SQUAD_ID else []
+                # Если DEFAULT_SQUAD_ID не задан — сохраняем текущие сквады, чтобы подписка не стала "неактивной"
+                if DEFAULT_SQUAD_ID:
+                    squad_ids = [DEFAULT_SQUAD_ID]
+                else:
+                    squad_ids = current_squads or []
         
         patch_payload = {
-            "uuid": user.remnawave_uuid,
+            "uuid": remnawave_uuid,
             "expireAt": new_expire_dt.isoformat(),
             "activeInternalSquads": squad_ids
         }
@@ -177,6 +338,10 @@ def process_successful_payment(payment, user, tariff):
         if tariff.traffic_limit_bytes and tariff.traffic_limit_bytes > 0:
             patch_payload["trafficLimitBytes"] = tariff.traffic_limit_bytes
             patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        # Устанавливаем лимит устройств, если он указан в тарифе
+        if hasattr(tariff, 'hwid_device_limit') and tariff.hwid_device_limit is not None and tariff.hwid_device_limit > 0:
+            patch_payload["hwidDeviceLimit"] = tariff.hwid_device_limit
         
         h, c = get_remnawave_headers({"Content-Type": "application/json"})
         patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
@@ -191,31 +356,72 @@ def process_successful_payment(payment, user, tariff):
             if promo and promo.uses_left > 0:
                 promo.uses_left -= 1
         
+        # Если это покупка с баланса, баланс уже списан в purchase_with_balance
+        # Здесь только проверяем, что баланс достаточен (если еще не списан)
+        if payment.payment_provider == 'balance':
+            from modules.currency import convert_to_usd
+            amount_usd = convert_to_usd(payment.amount, payment.currency)
+            current_balance_usd = float(user.balance) if user.balance else 0.0
+            # Баланс должен быть уже списан в purchase_with_balance, но проверяем на всякий случай
+            if current_balance_usd < amount_usd:
+                print(f"Warning: Balance may not be sufficient for payment {payment.order_id}")
+                # Не возвращаем False, так как баланс уже списан в purchase_with_balance
+        
         payment.status = 'PAID'
         db.session.commit()
-        
-        # Начисляем реферальную комиссию
-        amount_usd = convert_to_usd(payment.amount, payment.currency)
-        add_referral_commission(user, amount_usd, is_tariff_purchase=True)
-        db.session.commit()
-        
-        cache.delete(f'live_data_{user.remnawave_uuid}')
-        cache.delete(f'nodes_{user.remnawave_uuid}')
-        cache.delete('all_live_users_map')
-        
-        # Отправляем уведомление админам
+
+        # Уведомления должны приходить даже если дальше упадут "не критичные" шаги (рефералка/кэш/синхронизация).
+        # Поэтому шлем их сразу после успешного коммита статуса платежа.
         try:
             from modules.notifications import notify_payment
             notify_payment(payment, user, tariff, is_balance_topup=False)
         except Exception as e:
             print(f"Error sending payment notification: {e}")
-        
-        # Отправляем уведомление пользователю в бот
+
         try:
-            from modules.notifications import send_user_payment_notification_async
-            send_user_payment_notification_async(user, is_successful=True, tariff_name=tariff.name, is_balance_topup=False, payment_order_id=payment.order_id, payment=payment)
+            # Важно: шлем синхронно, чтобы не терять уведомления из daemon-треда
+            from modules.notifications import send_user_payment_notification
+            ok, err = send_user_payment_notification(
+                user,
+                is_successful=True,
+                tariff_name=tariff.name,
+                is_balance_topup=False,
+                payment_order_id=payment.order_id,
+                payment=payment,
+            )
+            if not ok and err:
+                print(f"User payment notification failed (sync): {err}")
         except Exception as e:
             print(f"Error sending user payment notification: {e}")
+        
+        # Начисляем реферальную комиссию
+        try:
+            amount_usd = convert_to_usd(payment.amount, payment.currency)
+            add_referral_commission(user, amount_usd, is_tariff_purchase=True)
+            db.session.commit()
+        except Exception as e:
+            # Не блокируем результат оплаты/уведомления из-за ошибок рефералки
+            print(f"Warning: referral commission failed for payment {payment.order_id}: {e}")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+        
+        # Очищаем кэш для всех конфигов пользователя
+        try:
+            cache.delete(f'live_data_{remnawave_uuid}')
+            cache.delete(f'nodes_{remnawave_uuid}')
+            cache.delete('all_live_users_map')
+        except Exception as e:
+            print(f"Warning: cache clear failed for uuid {remnawave_uuid}: {e}")
+        
+        # Очищаем кэш для основного конфига, если это был дополнительный
+        if payment.user_config_id and remnawave_uuid != user.remnawave_uuid:
+            try:
+                cache.delete(f'live_data_{user.remnawave_uuid}')
+                cache.delete(f'nodes_{user.remnawave_uuid}')
+            except Exception as e:
+                print(f"Warning: cache clear failed for primary uuid {user.remnawave_uuid}: {e}")
         
         # Синхронизация с ботом
         if BOT_API_URL and BOT_API_TOKEN:
@@ -460,6 +666,156 @@ def yookassa_webhook():
         
     except Exception as e:
         print(f"[YOOKASSA] Error: {e}")
+        return jsonify({"status": "error", "message": str(e)[:200]}), 500
+
+
+@app.route('/api/webhook/yoomoney', methods=['GET', 'POST'])
+def yoomoney_webhook():
+    """
+    YooMoney HTTP notifications (payment buttons / quickpay)
+
+    Документация:
+    - https://yoomoney.ru/docs/payment-buttons/using-api/notifications
+    - sha1_hash = SHA1("notification_type&operation_id&amount&currency&datetime&sender&codepro&notification_secret&label")
+    """
+    if request.method == 'GET':
+        return jsonify({"status": "ok", "message": "YooMoney webhook is available"}), 200
+
+    try:
+        # YooMoney обычно шлет application/x-www-form-urlencoded
+        data = {}
+        if request.is_json:
+            data = request.json or {}
+        elif request.form:
+            # request.form может содержать MultiDict
+            data = {k: (v[0] if isinstance(v, list) else v) for k, v in request.form.to_dict(flat=False).items()}
+        else:
+            # fallback: попробуем распарсить raw как querystring-like
+            try:
+                raw = request.data.decode('utf-8', errors='ignore')
+                if raw:
+                    from urllib.parse import parse_qs
+                    parsed = parse_qs(raw, keep_blank_values=True)
+                    data = {k: (vals[0] if isinstance(vals, list) and vals else "") for k, vals in parsed.items()}
+            except Exception:
+                data = {}
+
+        print(f"[YOOMONEY] 📥 Webhook received: {json.dumps(data, indent=2, ensure_ascii=False)}")
+
+        notification_type = (data.get('notification_type') or '').strip()
+        operation_id = (data.get('operation_id') or '').strip()
+        amount = (data.get('amount') or '').strip()
+        currency = (data.get('currency') or '').strip()  # обычно "643"
+        dt = (data.get('datetime') or '').strip()
+        sender = (data.get('sender') or '').strip()
+        codepro = (data.get('codepro') or '').strip()  # обычно "false"
+        label = (data.get('label') or '').strip()
+        sha1_hash = (data.get('sha1_hash') or '').strip().lower()
+        unaccepted = (data.get('unaccepted') or '').strip().lower()
+
+        if not label:
+            return jsonify({"status": "error", "message": "Missing label"}), 400
+
+        # Проверка подписи
+        s = PaymentSetting.query.first()
+        secret = ""
+        if s and getattr(s, 'yoomoney_notification_secret', None):
+            try:
+                from modules.models.payment import decrypt_key as decrypt_key_model
+                secret = (decrypt_key_model(getattr(s, 'yoomoney_notification_secret', None)) or "").strip()
+            except Exception:
+                secret = ""
+
+        if secret:
+            base = f"{notification_type}&{operation_id}&{amount}&{currency}&{dt}&{sender}&{codepro}&{secret}&{label}"
+            calc = hashlib.sha1(base.encode('utf-8')).hexdigest().lower()
+            if not sha1_hash or calc != sha1_hash:
+                print(f"[YOOMONEY] ❌ Invalid sha1_hash: got={sha1_hash}, expected={calc}")
+                return jsonify({"status": "error", "message": "Invalid signature"}), 403
+        else:
+            # Без секрета невозможно надежно проверять уведомления
+            print("[YOOMONEY] ⚠️ notification_secret is not configured; refusing to process payment for security")
+            return jsonify({"status": "error", "message": "notification_secret is not configured"}), 500
+
+        # Базовые флаги
+        if codepro.lower() != 'false':
+            return jsonify({"status": "success", "message": "Ignored (codepro=true)"}), 200
+        if unaccepted and unaccepted != 'false':
+            return jsonify({"status": "success", "message": "Ignored (unaccepted=true)"}), 200
+
+        payment = Payment.query.filter_by(order_id=label).first()
+        if not payment and operation_id:
+            payment = Payment.query.filter_by(payment_system_id=operation_id).first()
+
+        if not payment:
+            print(f"[YOOMONEY] ⚠️ Payment not found for label={label} (ignoring)")
+            return jsonify({"status": "success", "message": "Payment not found"}), 200
+
+        if payment.status == 'PAID':
+            return jsonify({"status": "success", "message": "Payment already processed"}), 200
+
+        # Сохраняем operation_id
+        if operation_id:
+            payment.payment_system_id = operation_id
+            db.session.commit()
+
+        user = User.query.get(payment.user_id)
+        if not user:
+            return jsonify({"status": "success", "message": "User not found"}), 200
+
+        # Пополнение баланса
+        if payment.tariff_id is None:
+            current_balance_usd = float(user.balance) if user.balance else 0.0
+            amount_usd = convert_to_usd(payment.amount, payment.currency)
+            user.balance = current_balance_usd + amount_usd
+            payment.status = 'PAID'
+            db.session.commit()
+
+            # Рефералка
+            try:
+                add_referral_commission(user, amount_usd, is_tariff_purchase=False)
+                db.session.commit()
+            except Exception as e:
+                print(f"[YOOMONEY] Warning: referral commission failed: {e}")
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+
+            # Уведомления
+            try:
+                from modules.notifications import notify_payment
+                notify_payment(payment, user, is_balance_topup=True)
+            except Exception as e:
+                print(f"[YOOMONEY] Error sending payment notification: {e}")
+
+            try:
+                from modules.notifications import send_user_payment_notification_async
+                send_user_payment_notification_async(user, is_successful=True, is_balance_topup=True, payment=payment)
+            except Exception as e:
+                print(f"[YOOMONEY] Error sending user payment notification: {e}")
+
+            try:
+                cache.delete(f'live_data_{user.remnawave_uuid}')
+                cache.delete('all_live_users_map')
+            except Exception:
+                pass
+
+            return jsonify({"status": "success"}), 200
+
+        # Покупка тарифа
+        tariff = Tariff.query.get(payment.tariff_id)
+        if not tariff:
+            return jsonify({"status": "success", "message": "Tariff not found"}), 200
+
+        # process_successful_payment сам выставит статус и уведомления
+        ok = process_successful_payment(payment, user, tariff)
+        return jsonify({"status": "success", "processed": bool(ok)}), 200
+
+    except Exception as e:
+        print(f"[YOOMONEY] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)[:200]}), 500
 
 

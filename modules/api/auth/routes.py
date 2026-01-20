@@ -23,6 +23,8 @@ from modules.auth import create_local_jwt
 from modules.models.user import User
 from modules.models.system import SystemSetting
 from modules.models.referral import ReferralSetting
+from modules.models.branding import BrandingSetting
+from modules.models.bot_config import BotConfig
 
 app = get_app()
 db = get_db()
@@ -74,16 +76,16 @@ def send_email_in_background(app_context, recipient, subject, html_body):
             mail_password = current_app.config.get('MAIL_PASSWORD')
             
             if not all([mail_server, mail_username, mail_password]):
-                print(f"[EMAIL] Mail not configured")
+                app.logger.warning(f"[EMAIL] Mail not configured - MAIL_SERVER: {bool(mail_server)}, MAIL_USERNAME: {bool(mail_username)}, MAIL_PASSWORD: {bool(mail_password)}")
                 return
             
             msg = Message(subject, recipients=[recipient])
             msg.html = html_body
             mail.send(msg)
-            print(f"[EMAIL] ✓ Sent to {recipient}")
+            app.logger.info(f"[EMAIL] ✓ Sent to {recipient}")
             
         except Exception as e:
-            print(f"[EMAIL] ❌ Error: {e}")
+            app.logger.error(f"[EMAIL] ❌ Error sending email to {recipient}: {e}", exc_info=True)
 
 
 def get_system_settings():
@@ -147,23 +149,58 @@ def public_register():
 
     expire_date = (datetime.now(timezone.utc) + timedelta(days=bonus_days_new)).isoformat()
 
-    payload_create = {
-        "email": email, "password": password, "username": clean_username,
-        "expireAt": expire_date,
-        "activeInternalSquads": [os.getenv("DEFAULT_SQUAD_ID")] if referrer else []
-    }
-
     try:
         headers, cookies = get_remnawave_headers()
-        resp = requests.post(f"{os.getenv('API_URL')}/api/users", headers=headers, cookies=cookies, json=payload_create)
-        resp.raise_for_status()
-        remnawave_uuid = resp.json().get('response', {}).get('uuid')
+        API_URL = os.getenv('API_URL')
+        
+        # Сначала проверяем, существует ли пользователь в RemnaWave по email
+        existing_remnawave_user = None
+        try:
+            # URL-encode email для безопасной передачи
+            import urllib.parse
+            encoded_email = urllib.parse.quote(email, safe='')
+            check_resp = requests.get(
+                f"{API_URL}/api/users/by-email/{encoded_email}",
+                headers=headers,
+                cookies=cookies,
+                timeout=15
+            )
+            if check_resp.status_code == 200:
+                check_data = check_resp.json()
+                # API может вернуть response с пользователем или массив пользователей
+                if check_data.get('response'):
+                    existing_remnawave_user = check_data['response']
+                    if isinstance(existing_remnawave_user, list) and len(existing_remnawave_user) > 0:
+                        existing_remnawave_user = existing_remnawave_user[0]
+                print(f"Found existing user in RemnaWave by email: {existing_remnawave_user.get('uuid') if existing_remnawave_user else 'None'}")
+        except Exception as e:
+            print(f"Error checking existing user by email: {e}")
+        
+        # Если пользователь существует в RemnaWave - используем его UUID
+        if existing_remnawave_user and existing_remnawave_user.get('uuid'):
+            remnawave_uuid = existing_remnawave_user.get('uuid')
+            print(f"Using existing RemnaWave user UUID: {remnawave_uuid}")
+        else:
+            # Пользователь не найден - создаём нового
+            payload_create = {
+                "email": email, "password": password, "username": clean_username,
+                "expireAt": expire_date,
+                "activeInternalSquads": [os.getenv("DEFAULT_SQUAD_ID")] if referrer else []
+            }
+
+            resp = requests.post(f"{API_URL}/api/users", headers=headers, cookies=cookies, json=payload_create)
+            resp.raise_for_status()
+            remnawave_uuid = resp.json().get('response', {}).get('uuid')
 
         if not remnawave_uuid:
             return jsonify({"message": "Provider Error"}), 500
 
         verif_token = ''.join(random.choices(string.ascii_letters + string.digits, k=50))
         sys_settings = get_system_settings() or create_system_settings()
+        
+        if not sys_settings:
+            print(f"Register Error: Failed to get or create system settings")
+            return jsonify({"message": "Internal Server Error"}), 500
 
         new_user = User(
             email=email, password_hash=hashed_password, remnawave_uuid=remnawave_uuid,
@@ -186,17 +223,28 @@ def public_register():
             print(f"Error sending new user notification: {e}")
 
         # Отправка email
-        your_server_ip = os.getenv('YOUR_SERVER_IP') or os.getenv('YOUR_SERVER_IP_OR_DOMAIN')
-        if your_server_ip:
-            your_server_ip = your_server_ip.strip()
-            if not your_server_ip.startswith(('http://', 'https://')):
-                your_server_ip = f"https://{your_server_ip}"
-        else:
-            your_server_ip = "https://testpanel.stealthnet.app"
+        try:
+            your_server_ip = os.getenv('YOUR_SERVER_IP') or os.getenv('YOUR_SERVER_IP_OR_DOMAIN')
+            if your_server_ip:
+                your_server_ip = your_server_ip.strip()
+                if not your_server_ip.startswith(('http://', 'https://')):
+                    your_server_ip = f"https://{your_server_ip}"
+            else:
+                your_server_ip = "https://testpanel.stealthnet.app"
 
-        url = f"{your_server_ip}/verify?token={verif_token}"
-        html = render_template('email_verification.html', verification_url=url)
-        threading.Thread(target=send_email_in_background, args=(app.app_context(), email, "Подтвердите email", html)).start()
+            url = f"{your_server_ip}/verify?token={verif_token}"
+            # Получаем branding и service_name для шаблона
+            branding = BrandingSetting.query.first()
+            bot_config = BotConfig.query.first()
+            service_name = bot_config.service_name if bot_config else (branding.site_name if branding else "StealthNET")
+            html = render_template('email_verification.html', 
+                                 verification_url=url,
+                                 branding=branding,
+                                 service_name=service_name)
+            threading.Thread(target=send_email_in_background, args=(app.app_context(), email, "Подтвердите email", html)).start()
+        except Exception as e:
+            print(f"Error preparing email: {e}")
+            # Не прерываем регистрацию из-за ошибки email
 
         # Бонус рефереру
         if referrer:
@@ -217,9 +265,14 @@ def public_register():
 
     except requests.exceptions.HTTPError as e:
         print(f"HTTP Error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"message": "Provider error"}), 500
     except Exception as e:
         print(f"Register Error: {e}")
+        import traceback
+        traceback.print_exc()
+        db.session.rollback()
         return jsonify({"message": "Internal Server Error"}), 500
 
 
@@ -394,7 +447,14 @@ def resend_verification():
                 your_server_ip = "https://testpanel.stealthnet.app"
 
             url = f"{your_server_ip}/verify?token={user.verification_token}"
-            html = render_template('email_verification.html', verification_url=url)
+            # Получаем branding и service_name для шаблона
+            branding = BrandingSetting.query.first()
+            bot_config = BotConfig.query.first()
+            service_name = bot_config.service_name if bot_config else (branding.site_name if branding else "StealthNET")
+            html = render_template('email_verification.html', 
+                                 verification_url=url,
+                                 branding=branding,
+                                 service_name=service_name)
             threading.Thread(target=send_email_in_background, args=(app.app_context(), email, "Verify Email", html)).start()
 
         return jsonify({"message": "Sent"}), 200

@@ -93,10 +93,15 @@ def payment_settings(current_admin):
             "yookassa_secret_key": decrypt_key(s.yookassa_secret_key),
             "yookassa_api_key": decrypt_key(s.yookassa_api_key),
             "yookassa_receipt_required": getattr(s, 'yookassa_receipt_required', False),
+
+            # YooMoney
+            "yoomoney_receiver": decrypt_key(getattr(s, 'yoomoney_receiver', None)),
+            "yoomoney_notification_secret": decrypt_key(getattr(s, 'yoomoney_notification_secret', None)),
             
             # Platega
             "platega_api_key": decrypt_key(getattr(s, 'platega_api_key', None)),
             "platega_merchant_id": decrypt_key(getattr(s, 'platega_merchant_id', None)),
+            "platega_mir_enabled": getattr(s, 'platega_mir_enabled', False),
             
             # MulenPay
             "mulenpay_api_key": decrypt_key(getattr(s, 'mulenpay_api_key', None)),
@@ -183,10 +188,16 @@ def payment_settings(current_admin):
             s.yookassa_api_key = encrypt_key(data.get('yookassa_api_key', ''))
         if 'yookassa_receipt_required' in data:
             s.yookassa_receipt_required = bool(data.get('yookassa_receipt_required', False))
+        if 'yoomoney_receiver' in data:
+            setattr(s, 'yoomoney_receiver', encrypt_key(data.get('yoomoney_receiver', '')))
+        if 'yoomoney_notification_secret' in data:
+            setattr(s, 'yoomoney_notification_secret', encrypt_key(data.get('yoomoney_notification_secret', '')))
         if 'platega_api_key' in data:
             setattr(s, 'platega_api_key', encrypt_key(data.get('platega_api_key', '')))
         if 'platega_merchant_id' in data:
             setattr(s, 'platega_merchant_id', encrypt_key(data.get('platega_merchant_id', '')))
+        if 'platega_mir_enabled' in data:
+            setattr(s, 'platega_mir_enabled', bool(data.get('platega_mir_enabled', False)))
         if 'mulenpay_api_key' in data:
             setattr(s, 'mulenpay_api_key', encrypt_key(data.get('mulenpay_api_key', '')))
         if 'mulenpay_secret_key' in data:
@@ -244,12 +255,31 @@ def available_payment_methods():
     """Получить список доступных платёжных методов"""
     def decrypt_key(key):
         """Расшифровка ключа"""
-        fernet = get_fernet()
-        if not key or not fernet:
+        if not key:
             return ""
+
+        fernet = get_fernet()
+
         try:
-            return fernet.decrypt(key).decode('utf-8')
-        except:
+            if isinstance(key, memoryview):
+                key = bytes(key)
+
+            if isinstance(key, str):
+                if not key.startswith('gAAAAAB'):
+                    return key
+                if not fernet:
+                    return ""
+                return fernet.decrypt(key.encode('utf-8')).decode('utf-8')
+
+            if isinstance(key, (bytes, bytearray)):
+                if not fernet:
+                    return ""
+                return fernet.decrypt(bytes(key)).decode('utf-8')
+
+            if not fernet:
+                return str(key)
+            return fernet.decrypt(bytes(key)).decode('utf-8')
+        except Exception:
             return ""
     
     try:
@@ -275,12 +305,20 @@ def available_payment_methods():
         yookassa_secret = decrypt_key(s.yookassa_secret_key) if s.yookassa_secret_key else None
         if yookassa_shop and yookassa_secret and yookassa_shop != "DECRYPTION_ERROR" and yookassa_secret != "DECRYPTION_ERROR":
             available.append('yookassa')
+
+        # YooMoney - нужны receiver и notification_secret
+        yoomoney_receiver = decrypt_key(getattr(s, 'yoomoney_receiver', None)) if getattr(s, 'yoomoney_receiver', None) else None
+        yoomoney_secret = decrypt_key(getattr(s, 'yoomoney_notification_secret', None)) if getattr(s, 'yoomoney_notification_secret', None) else None
+        if yoomoney_receiver and yoomoney_secret and yoomoney_receiver != "DECRYPTION_ERROR" and yoomoney_secret != "DECRYPTION_ERROR":
+            available.append('yoomoney')
         
         # Platega - нужны api_key и merchant_id
         platega_key = decrypt_key(getattr(s, 'platega_api_key', None)) if getattr(s, 'platega_api_key', None) else None
         platega_merchant = decrypt_key(getattr(s, 'platega_merchant_id', None)) if getattr(s, 'platega_merchant_id', None) else None
         if platega_key and platega_merchant and platega_key != "DECRYPTION_ERROR" and platega_merchant != "DECRYPTION_ERROR":
             available.append('platega')
+            if getattr(s, 'platega_mir_enabled', False):
+                available.append('platega_mir')
         
         # Mulenpay - нужны api_key, secret_key и shop_id
         mulenpay_key = decrypt_key(getattr(s, 'mulenpay_api_key', None)) if getattr(s, 'mulenpay_api_key', None) else None

@@ -221,6 +221,13 @@
         // Проверяем параметры URL
         const urlParams = new URLSearchParams(window.location.search);
         const orderId = urlParams.get('order_id') || urlParams.get('orderId');
+        const botParam = urlParams.get('bot'); // Параметр bot из URL (?bot=FFPN_bot)
+        
+        // Если передан параметр bot, используем его
+        if (botParam) {
+            botUsername = botParam.replace('@', '');
+            console.log('Bot username from URL:', botUsername);
+        }
         
         if (orderId) {
             document.getElementById('paymentDetails').style.display = 'block';
@@ -249,6 +256,7 @@
             }
             
             // Страница открыта в браузере - открываем miniapp через deep link
+            // startapp= открывает miniapp, без него просто бота
             const miniappLink = `https://t.me/${botUsername}/app`;
             window.location.href = miniappLink;
         }
