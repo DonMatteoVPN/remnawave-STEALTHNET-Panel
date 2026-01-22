@@ -5,7 +5,7 @@
 ![stealthnet](https://github.com/user-attachments/assets/e5c00d7c-58c1-447d-a539-6aa616856e0c)
 
 ## 🧪 [Тестовый сайт](https://panel.stealthnet.app/login) | 💬 **[Наш Чат](https://t.me/stealthnet_admin_panel)** - Для вопросов и предложений
-
+🌎 **[VPN под ключ + Партнерка STEALTHNET ознакомиться](https://partners.stealthnet.app/)**
 ## 📋 Содержание
 
 - [Описание](#-описание)
