@@ -200,9 +200,11 @@ Telegram Stars использует `CLIENT_BOT_TOKEN`
 ⚠️ **Важно**: Не все платежные системы обязательны. Настройте только те, которые вам нужны.
 
 ## Настройка SSL-сертификата
+```bash
    # Авто получение SSL ( Все делает автоматически и копирует сертификат в папку ) 
    #     chmod +x /opt/remnawave-STEALTHNET-Panel/scripts/ssl_issue_and_install.sh
    #     sudo /opt/remnawave-STEALTHNET-Panel/scripts/ssl_issue_and_install.sh -d panel.youdomain.com -e you@mail.com
+   ```
 ### Let's Encrypt (рекомендуется)
 
 ⚠️ Во время получения сертификата контейнер Nginx должен быть остановлен.
@@ -382,6 +384,7 @@ curl -X POST "https://api.telegram.org/botYOUR_BOT_TOKEN/setWebhook" \
 ---
 
 # Готово! StealthNET Admin Panel установлена и готова к работе.
+
 
 
 
