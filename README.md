@@ -231,6 +231,10 @@ Telegram бот для клиентов с полным функционалом
    #    cp /etc/letsencrypt/live/panel.stealthnet.app/privkey.pem nginx/ssl/
    # 4. Перезапустите Nginx:
    #    docker compose restart nginx
+
+   # Авто получение SSL ( Все делает автоматически и копирует сертификат в папку ) 
+   #     chmod +x /opt/remnawave-STEALTHNET-Panel/scripts/ssl_issue_and_install.sh
+   #     sudo /opt/remnawave-STEALTHNET-Panel/scripts/ssl_issue_and_install.sh -d panel.youdomain.com -e you@mail.com
    ```
 
 5. **Запустите проект**:
