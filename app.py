@@ -46,10 +46,12 @@ from modules.models.bot_config import BotConfig
 from modules.models.referral import ReferralSetting
 from modules.models.currency import CurrencyRate
 from modules.models.tariff_feature import TariffFeatureSetting
+from modules.models.tariff_level import TariffLevel
 from modules.models.auto_broadcast import AutoBroadcastMessage, AutoBroadcastSettings
 from modules.models.casino import CasinoGame, CasinoStats
 from modules.models.trial import TrialSettings
 from modules.models.user_config import UserConfig
+from modules.models.option import PurchaseOption
 
 # ============================================================================
 # ИМПОРТ API МАРШРУТОВ

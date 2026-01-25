@@ -26,6 +26,7 @@ from modules.models.payment import Payment, PaymentSetting
 from modules.models.referral import ReferralSetting
 from modules.models.branding import BrandingSetting
 from modules.models.user_config import UserConfig
+from modules.models.option import PurchaseOption
 
 app = get_app()
 db = get_db()
@@ -182,7 +183,14 @@ def miniapp_subscription():
             has_active = False
             if expire_at:
                 try:
-                    expire_dt = datetime.fromisoformat(expire_at) if isinstance(expire_at, str) else expire_at
+                    exp_raw = expire_at
+                    if isinstance(exp_raw, str):
+                        exp_raw = exp_raw.replace('Z', '+00:00')
+                        expire_dt = datetime.fromisoformat(exp_raw)
+                    else:
+                        expire_dt = exp_raw
+                    if hasattr(expire_dt, 'tzinfo') and expire_dt.tzinfo is None:
+                        expire_dt = expire_dt.replace(tzinfo=timezone.utc)
                     has_active = expire_dt > datetime.now(timezone.utc)
                 except:
                     pass
@@ -192,6 +200,15 @@ def miniapp_subscription():
             
             # Получаем активные сквады из данных RemnaWave
             active_squads = data_dict.get('activeInternalSquads', [])
+
+            # Нормализуем трафик: в RemnaWave usedTraffic обычно лежит в userTraffic.usedTrafficBytes
+            used_traffic = data_dict.get('usedTrafficBytes', None)
+            if used_traffic is None:
+                ut = data_dict.get('userTraffic', {})
+                if isinstance(ut, dict):
+                    used_traffic = ut.get('usedTrafficBytes', 0)
+            traffic_limit = data_dict.get('trafficLimitBytes', 0)
+            traffic_strategy = data_dict.get('trafficLimitStrategy')
             
             # Формируем данные пользователя (совместимо со старым мини-апп)
             user_data = {
@@ -204,8 +221,13 @@ def miniapp_subscription():
                 'subscription_status': 'active' if has_active else 'inactive',
                 'expireAt': expire_at,
                 'referral_code': user_obj.referral_code,
-                'traffic_used': data_dict.get('usedTrafficBytes', 0),
-                'traffic_limit': data_dict.get('trafficLimitBytes', 0),
+                # legacy snake_case (встречается в старых сборках miniapp)
+                'traffic_used': used_traffic or 0,
+                'traffic_limit': traffic_limit or 0,
+                # camelCase как в RemnaWave / и в коде miniapp UI
+                'usedTrafficBytes': used_traffic or 0,
+                'trafficLimitBytes': traffic_limit or 0,
+                'trafficLimitStrategy': traffic_strategy,
                 'balance': balance_display,
                 'balance_usd': float(user_obj.balance) if user_obj.balance else 0.0,
                 'currency': user_obj.preferred_currency or 'uah',
@@ -1484,12 +1506,19 @@ def miniapp_configs():
         API_URL = os.getenv('API_URL')
         headers, cookies = get_remnawave_headers()
         
-        # Получаем названия тарифов из брендинга
+        # Получаем названия уровней тарифов (TariffLevel), fallback на branding для базовых
         from modules.models.branding import BrandingSetting
+        from modules.models.tariff_level import TariffLevel
+
         branding = BrandingSetting.query.first()
         basic_name = getattr(branding, 'tariff_tier_basic_name', None) or 'Базовый'
         pro_name = getattr(branding, 'tariff_tier_pro_name', None) or 'Премиум'
         elite_name = getattr(branding, 'tariff_tier_elite_name', None) or 'Элитный'
+
+        tier_names = {lvl.code.lower(): (lvl.name or lvl.code) for lvl in TariffLevel.query.filter_by(is_active=True).all()}
+        tier_names.setdefault('basic', basic_name)
+        tier_names.setdefault('pro', pro_name)
+        tier_names.setdefault('elite', elite_name)
         
         configs = []
         
@@ -1545,12 +1574,7 @@ def miniapp_configs():
                     traffic_limit_bytes = tariff.traffic_limit_bytes if hasattr(tariff, 'traffic_limit_bytes') else None
                     
                     if tariff.tier:
-                        tier_names = {
-                            'basic': basic_name,
-                            'pro': pro_name,
-                            'elite': elite_name
-                        }
-                        tariff_name = tier_names.get(tariff.tier.lower(), tariff.tier.capitalize())
+                        tariff_name = tier_names.get(tariff.tier.lower(), tariff.tier)
                     else:
                         tariff_name = tariff.name
                     tariff_duration = tariff.duration_days
@@ -2213,6 +2237,189 @@ def miniapp_options():
 
 
 # ============================================================================
+# PURCHASE OPTIONS (Дополнительные опции: трафик, устройства, сквады)
+# ============================================================================
+
+@app.route('/miniapp/purchase-options', methods=['POST', 'OPTIONS'])
+@limiter.limit("30 per minute")
+def miniapp_get_purchase_options():
+    """Получить список доступных опций для покупки (трафик, устройства, сквады)"""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+
+    try:
+        data = request.json or {}
+        init_data = data.get('initData') or data.get('init_data') or ''
+        telegram_id, _ = parse_telegram_init_data(init_data)
+
+        if not telegram_id:
+            response = jsonify({"detail": {"title": "Authorization Error", "message": "Missing initData"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 401
+
+        user = User.query.filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            response = jsonify({"detail": {"title": "User Not Found", "message": "User not registered"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        options = PurchaseOption.query.filter_by(is_active=True).order_by(
+            PurchaseOption.option_type,
+            PurchaseOption.sort_order,
+            PurchaseOption.id
+        ).all()
+
+        options_by_type = {'traffic': [], 'devices': [], 'squad': []}
+        for opt in options:
+            opt_data = {
+                'id': opt.id,
+                'name': opt.name,
+                'description': opt.description,
+                'value': opt.value,
+                'unit': opt.unit,
+                'price_uah': opt.price_uah,
+                'price_rub': opt.price_rub,
+                'price_usd': opt.price_usd,
+                'icon': opt.icon
+            }
+            if opt.option_type in options_by_type:
+                options_by_type[opt.option_type].append(opt_data)
+
+        response = jsonify({"options": options_by_type, "user_currency": user.preferred_currency or 'rub'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        response = jsonify({"options": {"traffic": [], "devices": [], "squad": []}})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+
+@app.route('/miniapp/options/purchase', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+def miniapp_purchase_option():
+    """Покупка дополнительной опции"""
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+
+    try:
+        data = request.json or {}
+        init_data = data.get('initData') or data.get('init_data') or ''
+        telegram_id, _ = parse_telegram_init_data(init_data)
+
+        # Fallback для initDataUnsafe (для тестирования вне Telegram)
+        if not telegram_id:
+            unsafe = data.get('initDataUnsafe', {})
+            if isinstance(unsafe, dict) and unsafe.get('user'):
+                telegram_id = unsafe['user'].get('id')
+
+        if not telegram_id:
+            response = jsonify({"detail": {"title": "Authorization Error", "message": "Missing initData"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 401
+
+        user = User.query.filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            response = jsonify({"detail": {"title": "User Not Found", "message": "User not registered"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        option_id = data.get('option_id') or data.get('optionId')
+        payment_provider = data.get('payment_provider') or data.get('paymentProvider', 'crystalpay')
+        currency = data.get('currency') or user.preferred_currency or 'rub'
+        config_id = data.get('config_id') or data.get('configId')
+
+        if not option_id:
+            response = jsonify({"detail": {"title": "Invalid Request", "message": "option_id is required"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+
+        option = PurchaseOption.query.get(int(option_id))
+        if not option or not option.is_active:
+            response = jsonify({"detail": {"title": "Option Not Found", "message": "Option not found or inactive"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 404
+
+        currency_map = {
+            'uah': ('UAH', option.price_uah),
+            'rub': ('RUB', option.price_rub),
+            'usd': ('USD', option.price_usd)
+        }
+        currency_code, final_amount = currency_map.get(str(currency).lower(), ('RUB', option.price_rub))
+
+        if not final_amount or final_amount <= 0:
+            response = jsonify({"detail": {"title": "Price Error", "message": f"Price not set for currency {currency_code}"}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 400
+
+        order_id = f"OPT-{uuid.uuid4().hex[:12].upper()}"
+        payment_db = Payment(
+            order_id=order_id,
+            user_id=user.id,
+            tariff_id=None,
+            amount=final_amount,
+            currency=currency_code,
+            payment_provider=payment_provider,
+            promo_code_id=None,
+            status='PENDING'
+        )
+        payment_db.description = f"OPTION:{option.id}"
+
+        try:
+            if config_id:
+                payment_db.user_config_id = int(config_id)
+        except Exception:
+            pass
+
+        db.session.add(payment_db)
+        db.session.commit()
+
+        from modules.api.payments import create_payment as create_payment_provider
+        payment_url, payment_system_id = create_payment_provider(
+            provider=payment_provider,
+            amount=final_amount,
+            currency=currency_code,
+            order_id=order_id,
+            user_email=user.email,
+            source='miniapp'
+        )
+
+        if not payment_url:
+            error_msg = payment_system_id or "Failed to create payment"
+            response = jsonify({"detail": {"title": "Payment Error", "message": error_msg}})
+            response.headers.add('Access-Control-Allow-Origin', '*')
+            return response, 500
+
+        if payment_system_id:
+            payment_db.payment_system_id = payment_system_id
+            db.session.commit()
+
+        response = jsonify({
+            "payment_url": payment_url,
+            "payment_system_id": payment_system_id,
+            "order_id": order_id,
+            "option_name": option.name,
+            "amount": final_amount,
+            "currency": currency_code
+        })
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        response = jsonify({"detail": {"title": "Error", "message": str(e)}})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response, 500
+
+
+# ============================================================================
 # SUPPORT TICKETS
 # ============================================================================
 
@@ -2594,12 +2801,19 @@ def miniapp_payments_history():
             response.headers.add('Access-Control-Allow-Origin', '*')
             return response, 404
         
-        # Получаем названия тарифов из брендинга
+        # Получаем названия уровней тарифов (TariffLevel), fallback на branding для базовых
         from modules.models.branding import BrandingSetting
+        from modules.models.tariff_level import TariffLevel
+
         branding = BrandingSetting.query.first()
         basic_name = getattr(branding, 'tariff_tier_basic_name', None) or 'Базовый'
         pro_name = getattr(branding, 'tariff_tier_pro_name', None) or 'Премиум'
         elite_name = getattr(branding, 'tariff_tier_elite_name', None) or 'Элитный'
+
+        tier_names = {lvl.code.lower(): (lvl.name or lvl.code) for lvl in TariffLevel.query.filter_by(is_active=True).all()}
+        tier_names.setdefault('basic', basic_name)
+        tier_names.setdefault('pro', pro_name)
+        tier_names.setdefault('elite', elite_name)
         
         # Получаем платежи пользователя
         payments = Payment.query.filter_by(user_id=user.id).order_by(Payment.created_at.desc()).limit(50).all()
@@ -2611,12 +2825,7 @@ def miniapp_payments_history():
             if tariff:
                 # Используем tier для отображения (Basic, Pro, Elite), если он есть
                 if tariff.tier:
-                    tier_names = {
-                        'basic': basic_name,
-                        'pro': pro_name,
-                        'elite': elite_name
-                    }
-                    tariff_name = tier_names.get(tariff.tier.lower(), tariff.tier.capitalize())
+                    tariff_name = tier_names.get(tariff.tier.lower(), tariff.tier)
                 else:
                     # Проверяем, содержит ли name период (месяц, дней и т.д.)
                     period_patterns = [

@@ -25,6 +25,7 @@ from modules.models.tariff import Tariff
 from modules.models.promo import PromoCode
 from modules.models.referral import ReferralSetting
 from modules.currency import convert_to_usd
+from modules.models.option import PurchaseOption
 
 app = get_app()
 db = get_db()
@@ -122,6 +123,155 @@ def sync_subscription_to_bot(app_context, remnawave_uuid):
             )
         except Exception as e:
             print(f"Background sync error: {e}")
+
+
+def _resolve_target_remnawave_uuid(payment: Payment, user: User) -> str:
+    """
+    Определить RemnaWave UUID, к которому применять опцию.
+    Приоритет:
+    - payment.user_config_id (если задан)
+    - user.remnawave_uuid (если похоже на UUID)
+    - primary UserConfig пользователя
+    - первый UserConfig пользователя
+    """
+    try:
+        if getattr(payment, 'user_config_id', None):
+            from modules.models.user_config import UserConfig
+            cfg = UserConfig.query.get(payment.user_config_id)
+            if cfg and cfg.remnawave_uuid:
+                return cfg.remnawave_uuid
+    except Exception:
+        pass
+
+    try:
+        ruuid = getattr(user, 'remnawave_uuid', None)
+        if ruuid and isinstance(ruuid, str):
+            # в проекте встречались "email" в remnawave_uuid при переходах → фильтруем
+            if '@' not in ruuid and len(ruuid) >= 16:
+                return ruuid
+    except Exception:
+        pass
+
+    try:
+        from modules.models.user_config import UserConfig
+        primary = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+        if primary and primary.remnawave_uuid:
+            return primary.remnawave_uuid
+        any_cfg = UserConfig.query.filter_by(user_id=user.id).order_by(UserConfig.created_at.asc()).first()
+        if any_cfg and any_cfg.remnawave_uuid:
+            return any_cfg.remnawave_uuid
+    except Exception:
+        pass
+
+    return getattr(user, 'remnawave_uuid', None) or ""
+
+
+def process_option_purchase(payment, user):
+    """Обработка успешной покупки опции (трафик, устройства, сквад)"""
+    API_URL = os.getenv("API_URL")
+
+    try:
+        if not getattr(payment, 'description', None) or not str(payment.description).startswith('OPTION:'):
+            print(f"[OPTION] Invalid payment description: {getattr(payment, 'description', None)}")
+            return False
+
+        parts = str(payment.description).split(':')
+        if len(parts) < 2:
+            print(f"[OPTION] Invalid description format: {payment.description}")
+            return False
+
+        option_id = int(parts[1])
+        option = PurchaseOption.query.get(option_id)
+        if not option:
+            print(f"[OPTION] Option not found: {option_id}")
+            return False
+
+        target_uuid = _resolve_target_remnawave_uuid(payment, user)
+        if not target_uuid:
+            print(f"[OPTION] No target remnawave_uuid for user_id={user.id}, payment_id={payment.id}")
+            return False
+
+        # Получаем текущие данные пользователя из RemnaWave
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        resp = requests.get(f"{API_URL}/api/users/{target_uuid}", headers=h, cookies=c, timeout=15)
+        if resp.status_code != 200:
+            print(f"[OPTION] Failed to get user data: {resp.status_code} - {resp.text[:200]}")
+            return False
+
+        user_data = resp.json().get('response', {}) if isinstance(resp.json(), dict) else {}
+
+        patch_payload = {"uuid": target_uuid}
+        option_type = option.option_type
+        option_value = option.value
+
+        if option_type == 'traffic':
+            try:
+                gb_to_add = float(option_value)
+                bytes_to_add = int(gb_to_add * 1024 * 1024 * 1024)
+                current_limit = user_data.get('trafficLimitBytes', 0) or 0
+                patch_payload["trafficLimitBytes"] = int(current_limit) + bytes_to_add
+                patch_payload["trafficLimitStrategy"] = user_data.get('trafficLimitStrategy', 'NO_RESET')
+                print(f"[OPTION] Adding traffic: +{gb_to_add}GB to {target_uuid}")
+            except Exception:
+                print(f"[OPTION] Invalid traffic value: {option_value}")
+                return False
+
+        elif option_type == 'devices':
+            try:
+                devices_to_add = int(float(option_value))
+                current_limit = user_data.get('hwidDeviceLimit', 0) or 0
+                patch_payload["hwidDeviceLimit"] = int(current_limit) + devices_to_add
+                print(f"[OPTION] Adding devices: +{devices_to_add} to {target_uuid}")
+            except Exception:
+                print(f"[OPTION] Invalid devices value: {option_value}")
+                return False
+
+        elif option_type == 'squad':
+            squad_uuid = option.squad_uuid if option.squad_uuid else option_value
+            if not squad_uuid:
+                print(f"[OPTION] No squad UUID found for option {option_id}")
+                return False
+            current_squads = user_data.get('activeInternalSquads', []) or []
+            if squad_uuid not in current_squads:
+                patch_payload["activeInternalSquads"] = current_squads + [squad_uuid]
+            print(f"[OPTION] Adding squad: {squad_uuid} to {target_uuid}")
+
+        else:
+            print(f"[OPTION] Unknown option type: {option_type}")
+            return False
+
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload, timeout=20)
+        if not patch_resp.ok:
+            print(f"[OPTION] Failed to update user: {patch_resp.status_code} - {patch_resp.text[:200]}")
+            return False
+
+        payment.status = 'PAID'
+        db.session.commit()
+
+        # Очищаем кэш
+        try:
+            cache.delete(f'live_data_{target_uuid}')
+            cache.delete(f'nodes_{target_uuid}')
+            cache.delete(f'miniapp_nodes_{target_uuid}')
+        except Exception:
+            pass
+
+        # Реферальная комиссия (если PERCENT)
+        try:
+            amount_usd = convert_to_usd(payment.amount, payment.currency)
+            add_referral_commission(user, amount_usd, is_tariff_purchase=False)
+            db.session.commit()
+        except Exception as e:
+            print(f"[OPTION] Referral commission error: {e}")
+
+        print(f"[OPTION] Successfully processed option purchase: user_id={user.id}, option_id={option.id}")
+        return True
+
+    except Exception as e:
+        print(f"[OPTION] Error processing option purchase: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def process_successful_payment(payment, user, tariff):
@@ -465,10 +615,13 @@ def heleket_webhook():
         
         if status.upper() == 'PAID':
             user = User.query.get(payment.user_id)
-            tariff = Tariff.query.get(payment.tariff_id)
-            
-            if user and tariff:
-                process_successful_payment(payment, user, tariff)
+            is_option_purchase = bool(getattr(payment, 'description', None)) and str(payment.description).startswith('OPTION:')
+            if user and is_option_purchase:
+                process_option_purchase(payment, user)
+            else:
+                tariff = Tariff.query.get(payment.tariff_id)
+                if user and tariff:
+                    process_successful_payment(payment, user, tariff)
         
         return jsonify({"status": "success"}), 200
         
@@ -527,7 +680,8 @@ def yookassa_webhook():
             print(f"[YOOKASSA] 🔄 Processing refund: payment_id={payment_id}, amount={refund_amount} {refund_currency}, user_id={user.id}")
             
             # Откатываем изменения
-            if payment.tariff_id is None:
+            is_option_purchase = bool(getattr(payment, 'description', None)) and str(payment.description).startswith('OPTION:')
+            if payment.tariff_id is None and not is_option_purchase:
                 # Это было пополнение баланса - вычитаем сумму
                 current_balance_usd = float(user.balance) if user.balance else 0.0
                 refund_amount_usd = convert_to_usd(refund_amount, refund_currency)
@@ -541,12 +695,15 @@ def yookassa_webhook():
                 
                 print(f"[YOOKASSA] ✅ Balance refund processed: user_id={user.id}, refund={refund_amount_usd} USD, new_balance={new_balance} USD")
             else:
-                # Это была покупка тарифа - отменяем тариф (но не трогаем баланс, так как это возврат платежа)
+                # Это была покупка тарифа или опции - отмечаем как refunded (без изменения баланса)
                 payment.status = 'REFUNDED'
                 db.session.commit()
                 
                 # TODO: Можно добавить логику отмены тарифа через RemnaWave API, если нужно
-                print(f"[YOOKASSA] ✅ Tariff purchase refunded: user_id={user.id}, tariff_id={payment.tariff_id}")
+                if is_option_purchase:
+                    print(f"[YOOKASSA] ✅ Option purchase refunded: user_id={user.id}, payment_id={payment.id}")
+                else:
+                    print(f"[YOOKASSA] ✅ Tariff purchase refunded: user_id={user.id}, tariff_id={payment.tariff_id}")
             
             return jsonify({"status": "success"}), 200
         
@@ -617,6 +774,15 @@ def yookassa_webhook():
             
             # Если это пополнение баланса (tariff_id == None)
             if payment.tariff_id is None:
+                is_option_purchase = bool(getattr(payment, 'description', None)) and str(payment.description).startswith('OPTION:')
+                if is_option_purchase:
+                    ok = process_option_purchase(payment, user)
+                    if ok:
+                        print(f"[YOOKASSA] ✅ Option purchase successful: user_id={user.id}, payment_id={payment.id}")
+                    else:
+                        print(f"[YOOKASSA] ❌ Failed to process option purchase: user_id={user.id}, payment_id={payment.id}")
+                    return jsonify({"status": "success"}), 200
+
                 current_balance_usd = float(user.balance) if user.balance else 0.0
                 amount_usd = convert_to_usd(payment.amount, payment.currency)
                 new_balance = current_balance_usd + amount_usd
@@ -765,6 +931,11 @@ def yoomoney_webhook():
 
         # Пополнение баланса
         if payment.tariff_id is None:
+            is_option_purchase = bool(getattr(payment, 'description', None)) and str(payment.description).startswith('OPTION:')
+            if is_option_purchase:
+                ok = process_option_purchase(payment, user)
+                return jsonify({"status": "success", "processed": bool(ok)}), 200
+
             current_balance_usd = float(user.balance) if user.balance else 0.0
             amount_usd = convert_to_usd(payment.amount, payment.currency)
             user.balance = current_balance_usd + amount_usd
@@ -874,6 +1045,11 @@ def telegram_webhook():
             
         # Пополнение баланса
         if p.tariff_id is None:
+            is_option_purchase = bool(getattr(p, 'description', None)) and str(p.description).startswith('OPTION:')
+            if is_option_purchase:
+                process_option_purchase(p, u)
+                return jsonify({"ok": True}), 200
+
             current_balance = float(u.balance) if u.balance else 0.0
             amount_usd = convert_to_usd(p.amount, p.currency)
             u.balance = current_balance + amount_usd
@@ -952,6 +1128,11 @@ def process_telegram_payment_internal():
         
         # Пополнение баланса
         if p.tariff_id is None:
+            is_option_purchase = bool(getattr(p, 'description', None)) and str(p.description).startswith('OPTION:')
+            if is_option_purchase:
+                ok = process_option_purchase(p, u)
+                return jsonify({"success": True, "processed": bool(ok)}), 200
+
             current_balance = float(u.balance) if u.balance else 0.0
             amount_usd = convert_to_usd(p.amount, p.currency)
             u.balance = current_balance + amount_usd
@@ -1056,10 +1237,13 @@ def robokassa_webhook():
             db.session.commit()
             
             user = User.query.get(payment.user_id)
-            tariff = Tariff.query.get(payment.tariff_id)
-            
-            if user and tariff:
-                process_successful_payment(payment, user, tariff)
+            is_option_purchase = bool(getattr(payment, 'description', None)) and str(payment.description).startswith('OPTION:')
+            if user and is_option_purchase:
+                process_option_purchase(payment, user)
+            else:
+                tariff = Tariff.query.get(payment.tariff_id)
+                if user and tariff:
+                    process_successful_payment(payment, user, tariff)
         
         return f"OK{order_id}", 200
         
@@ -1102,6 +1286,11 @@ def crystalpay_webhook():
         
         # Если это пополнение баланса (tariff_id == None)
         if p.tariff_id is None:
+            is_option_purchase = bool(getattr(p, 'description', None)) and str(p.description).startswith('OPTION:')
+            if is_option_purchase:
+                process_option_purchase(p, u)
+                return jsonify({"error": False}), 200
+
             current_balance_usd = float(u.balance) if u.balance else 0.0
             amount_usd = convert_to_usd(p.amount, p.currency)
             u.balance = current_balance_usd + amount_usd

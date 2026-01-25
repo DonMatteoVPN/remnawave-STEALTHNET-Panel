@@ -30,26 +30,30 @@ def run_all_schema_migrations(app=None):
     # Список скриптов миграции в порядке выполнения
     # Важно: порядок имеет значение для зависимостей между таблицами
     migration_scripts = [
-        ('add_referral_fields.py', 'add_referral_fields'),
-        ('add_user_blocking_fields.py', 'add_user_blocking_fields'),  # Раньше, чтобы is_blocked был доступен
-        ('add_referral_percent_to_user.py', 'add_referral_percent_to_user'),
-        ('fix_referral_percent_default.py', 'migrate'),
-        ('add_branding_fields.py', 'add_branding_fields'),
-        ('add_favicon_url_to_branding.py', 'add_favicon_url_to_branding'),  # После add_branding_fields, на случай если favicon_url не был добавлен
-        ('add_yookassa_receipt_field.py', 'add_yookassa_receipt_field'),
-        ('add_yoomoney_fields.py', 'add_yoomoney_fields'),
-        ('add_platega_mir_enabled.py', 'migrate'),  # Галочка "Карты МИР" для Platega
-        ('add_squad_ids_to_tariff.py', 'add_squad_ids_to_tariff'),
-        ('add_squad_id_to_promo_code.py', 'add_squad_id_to_promo_code'),
-        ('add_is_admin_to_ticket_message.py', 'add_is_admin_to_ticket_message'),
-        ('add_telegram_message_id_to_payment.py', 'add_telegram_message_id_to_payment'),
-        ('add_button_fields_to_auto_broadcast.py', 'add_button_fields_to_auto_broadcast'),  # Поля кнопок для авторассылки
-        ('add_casino_tables.py', 'add_casino_tables'),  # Таблицы казино
+        ('migration/schema/add_referral_fields.py', 'add_referral_fields'),
+        ('migration/schema/add_user_blocking_fields.py', 'add_user_blocking_fields'),  # Раньше, чтобы is_blocked был доступен
+        ('migration/schema/add_referral_percent_to_user.py', 'add_referral_percent_to_user'),
+        ('migration/schema/fix_referral_percent_default.py', 'migrate'),
+        ('migration/schema/add_branding_fields.py', 'add_branding_fields'),
+        ('migration/schema/add_bot_config_menu_fields.py', 'migrate'),
+        ('migration/schema/add_favicon_url_to_branding.py', 'add_favicon_url_to_branding'),  # После add_branding_fields, на случай если favicon_url не был добавлен
+        ('migration/schema/add_yookassa_receipt_field.py', 'add_yookassa_receipt_field'),
+        ('migration/schema/add_yoomoney_fields.py', 'add_yoomoney_fields'),
+        ('migration/schema/add_platega_mir_enabled.py', 'migrate'),  # Галочка "Карты МИР" для Platega
+        ('migration/schema/add_squad_ids_to_tariff.py', 'add_squad_ids_to_tariff'),
+        ('migration/schema/add_tariff_levels_table.py', 'add_tariff_levels_table'),
+        ('migration/schema/add_squad_id_to_promo_code.py', 'add_squad_id_to_promo_code'),
+        ('migration/schema/add_is_admin_to_ticket_message.py', 'add_is_admin_to_ticket_message'),
+        ('migration/schema/add_telegram_message_id_to_payment.py', 'add_telegram_message_id_to_payment'),
+        ('migration/schema/add_description_to_payment.py', 'add_description_to_payment'),
+        ('migration/schema/add_button_fields_to_auto_broadcast.py', 'add_button_fields_to_auto_broadcast'),  # Поля кнопок для авторассылки
+        ('migration/schema/add_casino_tables.py', 'add_casino_tables'),  # Таблицы казино
         ('migration/migrate_add_trial_settings.py', 'migrate_add_trial_settings'),  # Настройки триала
-        ('add_trial_used_to_user.py', 'migrate'),  # Поле trial_used в user (должно быть ДО add_user_config_table)
-        ('add_user_config_table.py', 'migrate'),  # Таблица для нескольких конфигов пользователя
-        ('add_user_config_id_to_payment.py', 'migrate'),  # Поле user_config_id в payment
-        ('add_create_new_config_to_payment.py', 'migrate'),  # Поле create_new_config в payment
+        ('migration/schema/add_trial_used_to_user.py', 'migrate'),  # Поле trial_used в user (должно быть ДО add_user_config_table)
+        ('migration/schema/add_user_config_table.py', 'migrate'),  # Таблица для нескольких конфигов пользователя
+        ('migration/schema/add_user_config_id_to_payment.py', 'migrate'),  # Поле user_config_id в payment
+        ('migration/schema/add_create_new_config_to_payment.py', 'migrate'),  # Поле create_new_config в payment
+        ('migration/schema/add_purchase_options_table.py', 'add_purchase_options_table'),
     ]
     
     success_count = 0

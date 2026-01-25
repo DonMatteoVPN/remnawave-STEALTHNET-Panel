@@ -25,6 +25,7 @@ from modules.models.referral import ReferralSetting
 from modules.currency import convert_from_usd, convert_to_usd, parse_iso_datetime, convert_to_usd, parse_iso_datetime
 from modules.models.tariff import Tariff
 from modules.models.payment import Payment, PaymentSetting
+from modules.models.option import PurchaseOption
 from modules.core import get_fernet
 from modules.api.payments.base import decrypt_key, get_return_url
 
@@ -603,6 +604,98 @@ def get_client_configs():
         import traceback
         traceback.print_exc()
         return jsonify({"message": "Internal Error"}), 500
+
+
+# ============================================================================
+# CREATE OPTION PAYMENT (Покупка дополнительных опций)
+# ============================================================================
+
+@app.route("/api/client/create-option-payment", methods=["POST"])
+def create_option_payment():
+    """Создать платеж за дополнительную опцию"""
+    user = get_user_from_token()
+    if not user:
+        return jsonify({"message": "Auth Error"}), 401
+
+    try:
+        data = request.get_json(silent=True) or {}
+        option_id = data.get("option_id") or data.get("optionId")
+        payment_provider = data.get("payment_provider") or data.get("paymentProvider") or "crystalpay"
+        config_id = data.get("config_id") or data.get("configId")
+
+        if not option_id:
+            return jsonify({"message": "option_id обязателен"}), 400
+
+        option = PurchaseOption.query.get(int(option_id))
+        if not option or not option.is_active:
+            return jsonify({"message": "Опция не найдена или неактивна"}), 404
+
+        currency = user.preferred_currency or "rub"
+        currency_map = {
+            "uah": ("UAH", option.price_uah),
+            "rub": ("RUB", option.price_rub),
+            "usd": ("USD", option.price_usd)
+        }
+        currency_code, amount = currency_map.get(str(currency).lower(), ("RUB", option.price_rub))
+
+        if not amount or amount <= 0:
+            return jsonify({"message": f"Цена не установлена для валюты {currency_code}"}), 400
+
+        import uuid
+        order_id = f"OPT-{uuid.uuid4().hex[:12].upper()}"
+
+        payment_db = Payment(
+            order_id=order_id,
+            user_id=user.id,
+            tariff_id=None,
+            amount=amount,
+            currency=currency_code,
+            payment_provider=payment_provider,
+            promo_code_id=None,
+            status="PENDING"
+        )
+        payment_db.description = f"OPTION:{option.id}"
+
+        # опционально - к какому конфигу применить
+        try:
+            if config_id:
+                payment_db.user_config_id = int(config_id)
+        except Exception:
+            pass
+
+        db.session.add(payment_db)
+        db.session.commit()
+
+        from modules.api.payments import create_payment as create_payment_provider
+        payment_url, payment_system_id = create_payment_provider(
+            provider=payment_provider,
+            amount=amount,
+            currency=currency_code,
+            order_id=order_id,
+            user_email=user.email,
+            description=f"Опция: {option.name}",
+            source="website"
+        )
+
+        if not payment_url:
+            error_msg = payment_system_id or "Ошибка создания платежа"
+            return jsonify({"message": error_msg}), 500
+
+        if payment_system_id:
+            payment_db.payment_system_id = payment_system_id
+            db.session.commit()
+
+        return jsonify({
+            "payment_url": payment_url,
+            "payment_system_id": payment_system_id,
+            "order_id": order_id
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Ошибка создания платежа"}), 500
 
 
 @app.route('/api/client/activate-trial', methods=['POST'])

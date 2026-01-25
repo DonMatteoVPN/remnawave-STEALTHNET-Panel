@@ -15,6 +15,10 @@ class BotConfig(db.Model):
     support_bot_username = db.Column(db.String(100), nullable=True)
     
     # Видимость кнопок
+    show_connect_button = db.Column(db.Boolean, default=True, nullable=False)
+    show_status_button = db.Column(db.Boolean, default=True, nullable=False)
+    show_tariffs_button = db.Column(db.Boolean, default=True, nullable=False)
+    show_options_button = db.Column(db.Boolean, default=True, nullable=False)
     show_webapp_button = db.Column(db.Boolean, default=True, nullable=False)
     show_trial_button = db.Column(db.Boolean, default=True, nullable=False)
     show_referral_button = db.Column(db.Boolean, default=True, nullable=False)
@@ -23,6 +27,7 @@ class BotConfig(db.Model):
     show_agreement_button = db.Column(db.Boolean, default=True, nullable=False)
     show_offer_button = db.Column(db.Boolean, default=True, nullable=False)
     show_topup_button = db.Column(db.Boolean, default=True, nullable=False)
+    show_settings_button = db.Column(db.Boolean, default=True, nullable=False)
     
     # Триал
     trial_days = db.Column(db.Integer, default=3, nullable=False)

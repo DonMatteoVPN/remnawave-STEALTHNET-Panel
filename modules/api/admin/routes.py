@@ -38,6 +38,8 @@ from modules.models.tariff_feature import TariffFeatureSetting
 from modules.models.currency import CurrencyRate
 from modules.models.auto_broadcast import AutoBroadcastMessage, AutoBroadcastSettings
 from modules.models.trial import TrialSettings
+from modules.models.tariff_level import TariffLevel
+from modules.models.option import PurchaseOption
 
 app = get_app()
 db = get_db()
@@ -79,9 +81,46 @@ def get_admin_users(current_admin):
         if not live_map:
             headers, cookies = get_remnawave_headers()
             try:
-                resp = requests.get(f"{os.getenv('API_URL')}/api/users", headers=headers, cookies=cookies, timeout=10)
-                data = resp.json().get('response', {})
-                users_list = data.get('users', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                # RemnaWave /api/users поддерживает пагинацию (size/start). Без параметров может вернуться
+                # только первая страница, из-за чего большинство пользователей будет "не найдено".
+                users_list = []
+                start = 0
+                size = 1000
+                total = None
+                while True:
+                    resp = requests.get(
+                        f"{os.getenv('API_URL')}/api/users",
+                        params={"size": size, "start": start},
+                        headers=headers,
+                        cookies=cookies,
+                        timeout=15
+                    )
+                    payload = resp.json() if resp is not None else {}
+                    data = payload.get('response', payload) if isinstance(payload, dict) else payload
+
+                    if isinstance(data, dict):
+                        chunk = data.get('users', []) or []
+                        if total is None:
+                            try:
+                                total = int(data.get('total')) if data.get('total') is not None else None
+                            except Exception:
+                                total = None
+                    elif isinstance(data, list):
+                        chunk = data
+                    else:
+                        chunk = []
+
+                    if not isinstance(chunk, list) or len(chunk) == 0:
+                        break
+
+                    users_list.extend(chunk)
+                    start += size
+
+                    if total is not None and len(users_list) >= total:
+                        break
+                    # Safety to avoid infinite loop if API behaves unexpectedly
+                    if start > 50000:
+                        break
                 # Создаем два индекса: по UUID и по email/username
                 live_map = {u['uuid']: u for u in users_list if isinstance(u, dict) and 'uuid' in u}
                 # Дополнительный индекс по email для поиска, если UUID не совпадает
@@ -575,6 +614,22 @@ def admin_update_user(current_admin, user_id):
         user = User.query.get(user_id)
         if not user:
             return jsonify({"message": "User not found"}), 404
+        
+        if not user.remnawave_uuid or not str(user.remnawave_uuid).strip():
+            return jsonify({"message": "User has no RemnaWave UUID"}), 400
+        
+        # Если включены несколько конфигов — применяем изменения к основному (primary) uuid
+        target_uuid = str(user.remnawave_uuid).strip()
+        try:
+            from modules.models.user_config import UserConfig
+            primary_cfg = UserConfig.query.filter_by(user_id=user.id, is_primary=True).first()
+            if primary_cfg and primary_cfg.remnawave_uuid and str(primary_cfg.remnawave_uuid).strip():
+                target_uuid = str(primary_cfg.remnawave_uuid).strip()
+                if user.remnawave_uuid != target_uuid:
+                    user.remnawave_uuid = target_uuid
+                    db.session.commit()
+        except Exception:
+            target_uuid = str(user.remnawave_uuid).strip()
 
         data = request.json
         if not data:
@@ -583,47 +638,233 @@ def admin_update_user(current_admin, user_id):
         action = data.get('action')
         if not action:
             return jsonify({"message": "Action is required. Valid actions: grant_tariff, grant_trial, set_device_limit"}), 400
-            
-        headers = {"Authorization": f"Bearer {os.getenv('ADMIN_TOKEN')}"}
+        
+        headers, cookies = get_remnawave_headers()
+
+        def _parse_dt(value):
+            """Parse ISO datetime string (handles trailing Z). Returns aware dt in UTC or None."""
+            if not value or not isinstance(value, str):
+                return None
+            try:
+                s = value
+                if s.endswith('Z'):
+                    s = s[:-1] + '+00:00'
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                return None
+
+        def _extract_squad_uuids(active_squads):
+            """Normalize activeInternalSquads from RemnaWave into list of UUID strings."""
+            out = []
+            if not isinstance(active_squads, list):
+                return out
+            for item in active_squads:
+                if isinstance(item, str) and item.strip():
+                    out.append(item.strip())
+                elif isinstance(item, dict):
+                    u = item.get('uuid') or item.get('id')
+                    if isinstance(u, str) and u.strip():
+                        out.append(u.strip())
+            # uniq preserving order
+            seen = set()
+            uniq = []
+            for x in out:
+                if x in seen:
+                    continue
+                uniq.append(x)
+                seen.add(x)
+            return uniq
 
         if action == 'grant_tariff':
             tariff_id = data.get('tariff_id')
-            days = data.get('days', 30)
             if not tariff_id:
                 return jsonify({"message": "Tariff ID is required"}), 400
             tariff = Tariff.query.get(tariff_id)
             if not tariff:
                 return jsonify({"message": "Tariff not found"}), 404
+            
+            # Если days явно передали — можно использовать как override, иначе берём duration_days(+bonus_days)
+            days_override = data.get('days')
+            try:
+                days_override = int(days_override) if days_override not in (None, "") else None
+                if days_override is not None and days_override <= 0:
+                    days_override = None
+            except Exception:
+                days_override = None
 
-            resp = requests.get(f"{os.getenv('API_URL')}/api/users/{user.remnawave_uuid}", headers=headers)
-            if resp.status_code == 200:
-                user_data = resp.json().get('response', {})
-                current_expire = user_data.get('expireAt')
-                if current_expire:
-                    new_expire_dt = datetime.fromisoformat(current_expire) + timedelta(days=days)
+            base_days = int(getattr(tariff, 'duration_days', 0) or 0)
+            bonus_days = int(getattr(tariff, 'bonus_days', 0) or 0)
+            days_to_add = days_override if days_override is not None else (base_days + bonus_days)
+            if days_to_add <= 0:
+                days_to_add = 30
+
+            resp = requests.get(
+                f"{os.getenv('API_URL')}/api/users/{target_uuid}",
+                headers=headers,
+                cookies=cookies,
+                timeout=10
+            )
+            if resp.status_code != 200:
+                return jsonify({"message": "Failed to get user data"}), 500
+
+            user_data = (resp.json() or {}).get('response', {}) if isinstance(resp.json(), dict) else {}
+            current_expire_dt = _parse_dt(user_data.get('expireAt'))
+            now = datetime.now(timezone.utc)
+            base_dt = max(now, current_expire_dt) if current_expire_dt else now
+            new_expire_dt = base_dt + timedelta(days=days_to_add)
+
+            # squads from tariff (or fallback)
+            squad_ids = []
+            try:
+                if hasattr(tariff, 'get_squad_ids'):
+                    squad_ids = tariff.get_squad_ids()
+                elif getattr(tariff, 'squad_ids', None):
+                    squad_ids = json.loads(tariff.squad_ids) if isinstance(tariff.squad_ids, str) else tariff.squad_ids
+            except Exception:
+                squad_ids = []
+
+            current_squads = _extract_squad_uuids(user_data.get('activeInternalSquads', []) or [])
+            if not squad_ids:
+                if getattr(tariff, 'squad_id', None):
+                    squad_ids = [tariff.squad_id]
                 else:
-                    new_expire_dt = datetime.now(timezone.utc) + timedelta(days=days)
-                
-                requests.patch(f"{os.getenv('API_URL')}/api/users", headers=headers,
-                             json={"uuid": user.remnawave_uuid, "expireAt": new_expire_dt.isoformat()})
-                cache.delete(f'live_data_{user.remnawave_uuid}')
-                return jsonify({"message": "Tariff granted successfully"}), 200
-            return jsonify({"message": "Failed to get user data"}), 500
+                    default_squad = os.getenv("DEFAULT_SQUAD_ID")
+                    squad_ids = [default_squad] if default_squad else (current_squads or [])
+
+            patch_payload = {
+                "uuid": target_uuid,
+                "expireAt": new_expire_dt.isoformat(),
+                "activeInternalSquads": squad_ids
+            }
+
+            # traffic / device limits from tariff
+            try:
+                if getattr(tariff, 'traffic_limit_bytes', 0) and int(tariff.traffic_limit_bytes) > 0:
+                    patch_payload["trafficLimitBytes"] = int(tariff.traffic_limit_bytes)
+                    patch_payload["trafficLimitStrategy"] = "NO_RESET"
+            except Exception:
+                pass
+
+            try:
+                if hasattr(tariff, 'hwid_device_limit') and tariff.hwid_device_limit is not None:
+                    patch_payload["hwidDeviceLimit"] = int(tariff.hwid_device_limit)
+            except Exception:
+                pass
+
+            patch_resp = requests.patch(
+                f"{os.getenv('API_URL')}/api/users",
+                headers=headers,
+                cookies=cookies,
+                json=patch_payload,
+                timeout=10
+            )
+            if not patch_resp.ok:
+                return jsonify({"message": "Failed to update user in RemnaWave"}), 500
+
+            cache.delete(f'live_data_{target_uuid}')
+            cache.delete('all_live_users_map')
+            return jsonify({
+                "message": "Tariff granted successfully",
+                "user_email": user.email,
+                "action": "grant_tariff",
+                "tariff_id": int(tariff_id),
+                "expireAt": new_expire_dt.isoformat(),
+                "activeInternalSquads": squad_ids
+            }), 200
 
         elif action == 'grant_trial':
             days = data.get('days', 3)
-            new_expire = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-            requests.patch(f"{os.getenv('API_URL')}/api/users", headers=headers,
-                         json={"uuid": user.remnawave_uuid, "expireAt": new_expire})
-            cache.delete(f'live_data_{user.remnawave_uuid}')
-            return jsonify({"message": "Trial granted successfully"}), 200
+            try:
+                days = int(days)
+            except Exception:
+                days = 3
+            if days <= 0:
+                days = 3
+
+            resp = requests.get(
+                f"{os.getenv('API_URL')}/api/users/{target_uuid}",
+                headers=headers,
+                cookies=cookies,
+                timeout=10
+            )
+            if resp.status_code != 200:
+                return jsonify({"message": "Failed to get user data"}), 500
+
+            payload = resp.json() or {}
+            user_data = payload.get('response', payload) if isinstance(payload, dict) else {}
+            current_expire_dt = _parse_dt(user_data.get('expireAt'))
+            now = datetime.now(timezone.utc)
+            base_dt = max(now, current_expire_dt) if current_expire_dt else now
+            new_expire_dt = base_dt + timedelta(days=days)
+
+            current_squads = _extract_squad_uuids(user_data.get('activeInternalSquads', []) or [])
+            # Если у пользователя уже есть сквады — сохраняем. Иначе ставим trial squad / default squad.
+            trial_squad = None
+            try:
+                referral_settings = ReferralSetting.query.first()
+                if referral_settings and getattr(referral_settings, 'trial_squad_id', None):
+                    trial_squad = referral_settings.trial_squad_id
+            except Exception:
+                trial_squad = None
+            if not trial_squad:
+                trial_squad = os.getenv("DEFAULT_SQUAD_ID")
+
+            patch_payload = {
+                "uuid": target_uuid,
+                "expireAt": new_expire_dt.isoformat(),
+                "activeInternalSquads": current_squads if current_squads else ([trial_squad] if trial_squad else [])
+            }
+
+            patch_resp = requests.patch(
+                f"{os.getenv('API_URL')}/api/users",
+                headers=headers,
+                cookies=cookies,
+                json=patch_payload,
+                timeout=10
+            )
+            if not patch_resp.ok:
+                return jsonify({"message": "Failed to update user in RemnaWave"}), 500
+
+            cache.delete(f'live_data_{target_uuid}')
+            cache.delete('all_live_users_map')
+            return jsonify({
+                "message": "Trial granted successfully",
+                "user_email": user.email,
+                "action": "grant_trial",
+                "expireAt": new_expire_dt.isoformat(),
+                "activeInternalSquads": patch_payload.get("activeInternalSquads", [])
+            }), 200
 
         elif action == 'set_device_limit':
             device_limit = data.get('device_limit', 0)
-            requests.patch(f"{os.getenv('API_URL')}/api/users", headers=headers,
-                         json={"uuid": user.remnawave_uuid, "hwidDeviceLimit": device_limit})
-            cache.delete(f'live_data_{user.remnawave_uuid}')
-            return jsonify({"message": "Device limit updated successfully"}), 200
+            try:
+                device_limit = int(device_limit)
+            except Exception:
+                device_limit = 0
+            if device_limit < 0:
+                device_limit = 0
+
+            patch_resp = requests.patch(
+                f"{os.getenv('API_URL')}/api/users",
+                headers=headers,
+                cookies=cookies,
+                json={"uuid": target_uuid, "hwidDeviceLimit": device_limit},
+                timeout=10
+            )
+            if not patch_resp.ok:
+                return jsonify({"message": "Failed to update user in RemnaWave"}), 500
+
+            cache.delete(f'live_data_{target_uuid}')
+            cache.delete('all_live_users_map')
+            return jsonify({
+                "message": "Device limit updated successfully",
+                "user_email": user.email,
+                "action": "set_device_limit",
+                "hwidDeviceLimit": device_limit
+            }), 200
 
         return jsonify({"message": "Invalid action"}), 400
 
@@ -713,6 +954,826 @@ def get_statistics(current_admin):
         import traceback
         traceback.print_exc()
         return jsonify({"message": "Internal Server Error"}), 500
+
+
+@app.route('/api/admin/analytics', methods=['GET'])
+@admin_required
+def get_analytics(current_admin):
+    """Получение расширенной аналитики с группировкой по дням, неделям, месяцам"""
+    try:
+        from sqlalchemy import func, extract, case, text
+        from modules.models.user_config import UserConfig
+        
+        # Определяем тип БД
+        is_postgresql = app.config.get('USE_POSTGRESQL', False)
+        period = request.args.get('period', 'days')  # days, weeks, months
+        
+        # Фильтры по датам (опционально)
+        start_date_param = request.args.get('start_date')
+        end_date_param = request.args.get('end_date')
+        custom_date_range = None
+        if start_date_param and end_date_param:
+            try:
+                custom_start = datetime.fromisoformat(start_date_param.replace('Z', '+00:00'))
+                custom_end = datetime.fromisoformat(end_date_param.replace('Z', '+00:00'))
+                custom_date_range = (custom_start, custom_end)
+            except:
+                pass
+        
+        # Определяем диапазон дат для общей статистики
+        if custom_date_range:
+            stats_start_date, stats_end_date = custom_date_range
+        else:
+            # Используем период по умолчанию
+            if period == 'days':
+                stats_end_date = datetime.now(timezone.utc)
+                stats_start_date = stats_end_date - timedelta(days=30)
+            elif period == 'weeks':
+                stats_end_date = datetime.now(timezone.utc)
+                stats_start_date = stats_end_date - timedelta(weeks=12)
+            else:  # months
+                stats_end_date = datetime.now(timezone.utc)
+                stats_start_date = stats_end_date - timedelta(days=365)
+        
+        # Общая статистика с учетом выбранного периода/диапазона
+        total_users = User.query.filter_by(role='CLIENT').filter(
+            User.created_at >= stats_start_date,
+            User.created_at <= stats_end_date
+        ).count()
+        verified_users = User.query.filter_by(role='CLIENT', is_verified=True).filter(
+            User.created_at >= stats_start_date,
+            User.created_at <= stats_end_date
+        ).count()
+        
+        # Конфиги созданные в выбранном периоде
+        total_configs = UserConfig.query.filter(
+            UserConfig.created_at >= stats_start_date,
+            UserConfig.created_at <= stats_end_date
+        ).count()
+        
+        total_payments = Payment.query.filter(
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).count()
+        successful_payments = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).count()
+        
+        # Статистика по пользователям в боте (с telegram_id) в выбранном периоде
+        users_with_telegram = User.query.filter_by(role='CLIENT').filter(
+            User.telegram_id.isnot(None),
+            User.created_at >= stats_start_date,
+            User.created_at <= stats_end_date
+        ).count()
+        
+        # Статистика по сайтам (конфигам) - пользователи с конфигами в выбранном периоде
+        configs_by_user = db.session.query(
+            func.count(UserConfig.id).label('config_count')
+        ).filter(
+            UserConfig.created_at >= stats_start_date,
+            UserConfig.created_at <= stats_end_date
+        ).group_by(UserConfig.user_id).all()
+        users_with_configs = len(configs_by_user)
+        
+        # Подсчет прибыли по валютам в выбранном периоде
+        paid_payments = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).all()
+        total_revenue = {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+        
+        for payment in paid_payments:
+            currency = payment.currency or 'USD'
+            amount = float(payment.amount) if payment.amount else 0.0
+            if currency in total_revenue:
+                total_revenue[currency] += amount
+        
+        # Группировка по периодам
+        revenue_by_period = []
+        user_registrations_by_period = []
+        payments_by_period = []
+        
+        if period == 'days':
+            # Используем кастомный диапазон или последние 30 дней
+            if custom_date_range:
+                start_date, end_date = custom_date_range
+            else:
+                end_date = datetime.now(timezone.utc)
+                start_date = end_date - timedelta(days=30)
+            
+            if is_postgresql:
+                # Доходы по дням (PostgreSQL)
+                revenue_query = db.session.query(
+                    func.date(Payment.created_at).label('date'),
+                    Payment.currency,
+                    func.sum(Payment.amount).label('total')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(
+                    func.date(Payment.created_at),
+                    Payment.currency
+                ).order_by('date').all()
+                
+                # Регистрации по дням
+                registrations_query = db.session.query(
+                    func.date(User.created_at).label('date'),
+                    func.count(User.id).label('count')
+                ).filter(
+                    User.role == 'CLIENT',
+                    User.created_at >= start_date,
+                    User.created_at <= end_date
+                ).group_by(func.date(User.created_at)).order_by('date').all()
+                
+                # Платежи по дням
+                payments_count_query = db.session.query(
+                    func.date(Payment.created_at).label('date'),
+                    func.count(Payment.id).label('count')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(func.date(Payment.created_at)).order_by('date').all()
+            else:
+                # SQLite - используем strftime
+                revenue_query = db.session.query(
+                    func.strftime('%Y-%m-%d', Payment.created_at).label('date'),
+                    Payment.currency,
+                    func.sum(Payment.amount).label('total')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(
+                    func.strftime('%Y-%m-%d', Payment.created_at),
+                    Payment.currency
+                ).order_by('date').all()
+                
+                registrations_query = db.session.query(
+                    func.strftime('%Y-%m-%d', User.created_at).label('date'),
+                    func.count(User.id).label('count')
+                ).filter(
+                    User.role == 'CLIENT',
+                    User.created_at >= start_date,
+                    User.created_at <= end_date
+                ).group_by(func.strftime('%Y-%m-%d', User.created_at)).order_by('date').all()
+                
+                payments_count_query = db.session.query(
+                    func.strftime('%Y-%m-%d', Payment.created_at).label('date'),
+                    func.count(Payment.id).label('count')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(func.strftime('%Y-%m-%d', Payment.created_at)).order_by('date').all()
+            
+            # Формируем данные по дням
+            date_dict = {}
+            for item in revenue_query:
+                if len(item) == 3:
+                    date, currency, total = item
+                    date_str = date.isoformat() if hasattr(date, 'isoformat') else str(date)
+                    if date_str not in date_dict:
+                        date_dict[date_str] = {'date': date_str, 'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                    if currency in date_dict[date_str]:
+                        date_dict[date_str][currency] += float(total)
+            
+            revenue_by_period = list(date_dict.values())
+            
+            # Регистрации
+            reg_dict = {str(item[0]): item[1] for item in registrations_query}
+            user_registrations_by_period = [
+                {'date': date, 'count': reg_dict.get(date, 0)}
+                for date in date_dict.keys()
+            ]
+            
+            # Платежи
+            payments_dict = {str(item[0]): item[1] for item in payments_count_query}
+            payments_by_period = [
+                {'date': date, 'count': payments_dict.get(date, 0)}
+                for date in date_dict.keys()
+            ]
+            
+        elif period == 'weeks':
+            # Используем кастомный диапазон или последние 12 недель
+            if custom_date_range:
+                start_date, end_date = custom_date_range
+            else:
+                end_date = datetime.now(timezone.utc)
+                start_date = end_date - timedelta(weeks=12)
+            
+            # Для PostgreSQL используем date_trunc, для SQLite - группируем в Python
+            if is_postgresql:
+                # Доходы по неделям (PostgreSQL)
+                revenue_query = db.session.query(
+                    func.date_trunc('week', Payment.created_at).label('week'),
+                    Payment.currency,
+                    func.sum(Payment.amount).label('total')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(
+                    func.date_trunc('week', Payment.created_at),
+                    Payment.currency
+                ).order_by('week').all()
+                
+                # Регистрации по неделям
+                registrations_query = db.session.query(
+                    func.date_trunc('week', User.created_at).label('week'),
+                    func.count(User.id).label('count')
+                ).filter(
+                    User.role == 'CLIENT',
+                    User.created_at >= start_date,
+                    User.created_at <= end_date
+                ).group_by(func.date_trunc('week', User.created_at)).order_by('week').all()
+                
+                # Платежи по неделям
+                payments_count_query = db.session.query(
+                    func.date_trunc('week', Payment.created_at).label('week'),
+                    func.count(Payment.id).label('count')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(func.date_trunc('week', Payment.created_at)).order_by('week').all()
+            else:
+                # SQLite - получаем все данные и группируем в Python
+                all_payments = Payment.query.filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).all()
+                
+                all_users = User.query.filter(
+                    User.role == 'CLIENT',
+                    User.created_at >= start_date,
+                    User.created_at <= end_date
+                ).all()
+                
+                # Группируем по неделям в Python
+                week_dict_rev = {}
+                week_dict_reg = {}
+                week_dict_pay = {}
+                
+                for payment in all_payments:
+                    if payment.created_at:
+                        # Находим начало недели (понедельник)
+                        week_start = payment.created_at - timedelta(days=payment.created_at.weekday())
+                        week_key = week_start.date().isoformat()
+                        
+                        if week_key not in week_dict_rev:
+                            week_dict_rev[week_key] = {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                        currency = payment.currency or 'USD'
+                        if currency in week_dict_rev[week_key]:
+                            week_dict_rev[week_key][currency] += float(payment.amount or 0)
+                        
+                        if week_key not in week_dict_pay:
+                            week_dict_pay[week_key] = 0
+                        week_dict_pay[week_key] += 1
+                
+                for user in all_users:
+                    if user.created_at:
+                        week_start = user.created_at - timedelta(days=user.created_at.weekday())
+                        week_key = week_start.date().isoformat()
+                        if week_key not in week_dict_reg:
+                            week_dict_reg[week_key] = 0
+                        week_dict_reg[week_key] += 1
+                
+                revenue_query = [
+                    (week_key, currency, amount)
+                    for week_key, currencies in week_dict_rev.items()
+                    for currency, amount in currencies.items()
+                    if amount > 0
+                ]
+                registrations_query = [(week_key, count) for week_key, count in week_dict_reg.items()]
+                payments_count_query = [(week_key, count) for week_key, count in week_dict_pay.items()]
+            
+            # Формируем данные
+            week_dict = {}
+            for item in revenue_query:
+                if len(item) == 3:
+                    week, currency, total = item
+                    week_str = week.isoformat() if hasattr(week, 'isoformat') else str(week)
+                    if week_str not in week_dict:
+                        week_dict[week_str] = {'date': week_str, 'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                    if currency in week_dict[week_str]:
+                        week_dict[week_str][currency] += float(total)
+            
+            revenue_by_period = list(week_dict.values())
+            
+            reg_dict = {str(item[0]): item[1] for item in registrations_query}
+            user_registrations_by_period = [
+                {'date': date, 'count': reg_dict.get(date, 0)}
+                for date in week_dict.keys()
+            ]
+            
+            payments_dict = {str(item[0]): item[1] for item in payments_count_query}
+            payments_by_period = [
+                {'date': date, 'count': payments_dict.get(date, 0)}
+                for date in week_dict.keys()
+            ]
+            
+        elif period == 'months':
+            # Используем кастомный диапазон или последние 12 месяцев
+            if custom_date_range:
+                start_date, end_date = custom_date_range
+            else:
+                end_date = datetime.now(timezone.utc)
+                start_date = end_date - timedelta(days=365)
+            
+            if is_postgresql:
+                # Доходы по месяцам (PostgreSQL)
+                revenue_query = db.session.query(
+                    func.date_trunc('month', Payment.created_at).label('month'),
+                    Payment.currency,
+                    func.sum(Payment.amount).label('total')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(
+                    func.date_trunc('month', Payment.created_at),
+                    Payment.currency
+                ).order_by('month').all()
+                
+                # Регистрации по месяцам
+                registrations_query = db.session.query(
+                    func.date_trunc('month', User.created_at).label('month'),
+                    func.count(User.id).label('count')
+                ).filter(
+                    User.role == 'CLIENT',
+                    User.created_at >= start_date,
+                    User.created_at <= end_date
+                ).group_by(func.date_trunc('month', User.created_at)).order_by('month').all()
+                
+                # Платежи по месяцам
+                payments_count_query = db.session.query(
+                    func.date_trunc('month', Payment.created_at).label('month'),
+                    func.count(Payment.id).label('count')
+                ).filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).group_by(func.date_trunc('month', Payment.created_at)).order_by('month').all()
+            else:
+                # SQLite - группируем в Python
+                all_payments = Payment.query.filter(
+                    Payment.status == 'PAID',
+                    Payment.created_at >= start_date,
+                    Payment.created_at <= end_date
+                ).all()
+                
+                all_users = User.query.filter(
+                    User.role == 'CLIENT',
+                    User.created_at >= start_date,
+                    User.created_at <= end_date
+                ).all()
+                
+                month_dict_rev = {}
+                month_dict_reg = {}
+                month_dict_pay = {}
+                
+                for payment in all_payments:
+                    if payment.created_at:
+                        month_key = payment.created_at.replace(day=1).date().isoformat()
+                        if month_key not in month_dict_rev:
+                            month_dict_rev[month_key] = {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                        currency = payment.currency or 'USD'
+                        if currency in month_dict_rev[month_key]:
+                            month_dict_rev[month_key][currency] += float(payment.amount or 0)
+                        
+                        if month_key not in month_dict_pay:
+                            month_dict_pay[month_key] = 0
+                        month_dict_pay[month_key] += 1
+                
+                for user in all_users:
+                    if user.created_at:
+                        month_key = user.created_at.replace(day=1).date().isoformat()
+                        if month_key not in month_dict_reg:
+                            month_dict_reg[month_key] = 0
+                        month_dict_reg[month_key] += 1
+                
+                revenue_query = [
+                    (month_key, currency, amount)
+                    for month_key, currencies in month_dict_rev.items()
+                    for currency, amount in currencies.items()
+                    if amount > 0
+                ]
+                registrations_query = [(month_key, count) for month_key, count in month_dict_reg.items()]
+                payments_count_query = [(month_key, count) for month_key, count in month_dict_pay.items()]
+            
+            # Формируем данные
+            month_dict = {}
+            for item in revenue_query:
+                if len(item) == 3:
+                    month, currency, total = item
+                    month_str = month.isoformat() if hasattr(month, 'isoformat') else str(month)
+                    if month_str not in month_dict:
+                        month_dict[month_str] = {'date': month_str, 'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                    if currency in month_dict[month_str]:
+                        month_dict[month_str][currency] += float(total)
+            
+            revenue_by_period = list(month_dict.values())
+            
+            reg_dict = {str(item[0]): item[1] for item in registrations_query}
+            user_registrations_by_period = [
+                {'date': date, 'count': reg_dict.get(date, 0)}
+                for date in month_dict.keys()
+            ]
+            
+            payments_dict = {str(item[0]): item[1] for item in payments_count_query}
+            payments_by_period = [
+                {'date': date, 'count': payments_dict.get(date, 0)}
+                for date in month_dict.keys()
+            ]
+        
+        # Статистика по провайдерам платежей в выбранном периоде
+        provider_stats = db.session.query(
+            Payment.payment_provider,
+            func.count(Payment.id).label('count'),
+            func.sum(Payment.amount).label('total')
+        ).filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).group_by(Payment.payment_provider).all()
+        
+        payment_providers = [
+            {
+                'provider': provider or 'unknown',
+                'count': count,
+                'total': float(total) if total else 0.0
+            }
+            for provider, count, total in provider_stats
+        ]
+        
+        # Дополнительные метрики
+        # ARPU и средний чек по валютам
+        arpu_by_currency = {
+            'USD': round(total_revenue['USD'] / total_users, 2) if total_users > 0 else 0.0,
+            'UAH': round(total_revenue['UAH'] / total_users, 2) if total_users > 0 else 0.0,
+            'RUB': round(total_revenue['RUB'] / total_users, 2) if total_users > 0 else 0.0
+        }
+        
+        # Средний чек на платеж по валютам
+        avg_payment_by_currency = {
+            'USD': round(total_revenue['USD'] / successful_payments, 2) if successful_payments > 0 else 0.0,
+            'UAH': round(total_revenue['UAH'] / successful_payments, 2) if successful_payments > 0 else 0.0,
+            'RUB': round(total_revenue['RUB'] / successful_payments, 2) if successful_payments > 0 else 0.0
+        }
+        
+        # Конверсия: регистрации -> платежи
+        conversion_rate = round((successful_payments / total_users * 100), 2) if total_users > 0 else 0.0
+        
+        # Статистика по тарифам (по валютам отдельно) в выбранном периоде
+        tariff_stats = db.session.query(
+            Tariff.id,
+            Tariff.name,
+            Payment.currency,
+            func.count(Payment.id).label('count'),
+            func.sum(Payment.amount).label('total')
+        ).join(
+            Payment, Payment.tariff_id == Tariff.id
+        ).filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).group_by(Tariff.id, Tariff.name, Payment.currency).all()
+        
+        # Группируем по тарифам и валютам
+        tariffs_dict = {}
+        for tariff_id, name, currency, count, total in tariff_stats:
+            if tariff_id not in tariffs_dict:
+                tariffs_dict[tariff_id] = {
+                    'id': tariff_id,
+                    'name': name,
+                    'count': 0,
+                    'revenue_by_currency': {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                }
+            tariffs_dict[tariff_id]['count'] += count
+            if currency in tariffs_dict[tariff_id]['revenue_by_currency']:
+                tariffs_dict[tariff_id]['revenue_by_currency'][currency] += float(total) if total else 0.0
+        
+        tariffs_analytics = sorted(
+            list(tariffs_dict.values()),
+            key=lambda x: x['count'],
+            reverse=True
+        )
+        
+        # Статистика по промокодам (по валютам отдельно) в выбранном периоде
+        promo_stats = db.session.query(
+            PromoCode.code,
+            Payment.currency,
+            func.count(Payment.id).label('count'),
+            func.sum(Payment.amount).label('total')
+        ).join(
+            Payment, Payment.promo_code_id == PromoCode.id
+        ).filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).group_by(PromoCode.code, Payment.currency).all()
+        
+        # Группируем по промокодам и валютам
+        promos_dict = {}
+        for code, currency, count, total in promo_stats:
+            if code not in promos_dict:
+                promos_dict[code] = {
+                    'code': code,
+                    'count': 0,
+                    'revenue_by_currency': {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+                }
+            promos_dict[code]['count'] += count
+            if currency in promos_dict[code]['revenue_by_currency']:
+                promos_dict[code]['revenue_by_currency'][currency] += float(total) if total else 0.0
+        
+        promocodes_analytics = sorted(
+            list(promos_dict.values()),
+            key=lambda x: x['count'],
+            reverse=True
+        )
+        
+        # Статистика по триалам в выбранном периоде
+        trial_users = User.query.filter_by(role='CLIENT', trial_used=True).filter(
+            User.created_at >= stats_start_date,
+            User.created_at <= stats_end_date
+        ).count()
+        trial_usage_rate = round((trial_users / total_users * 100), 2) if total_users > 0 else 0.0
+        
+        # Статистика по реферальной программе в выбранном периоде
+        users_with_referrer = User.query.filter_by(role='CLIENT').filter(
+            User.referrer_id.isnot(None),
+            User.created_at >= stats_start_date,
+            User.created_at <= stats_end_date
+        ).count()
+        referral_rate = round((users_with_referrer / total_users * 100), 2) if total_users > 0 else 0.0
+        
+        # Новые пользователи за последние периоды для сравнения (всегда за последние периоды, независимо от выбранного диапазона)
+        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday = today - timedelta(days=1)
+        week_ago = today - timedelta(days=7)
+        month_ago = today - timedelta(days=30)
+        
+        new_users_today = User.query.filter_by(role='CLIENT').filter(User.created_at >= today).count()
+        new_users_yesterday = User.query.filter_by(role='CLIENT').filter(
+            User.created_at >= yesterday,
+            User.created_at < today
+        ).count()
+        new_users_this_week = User.query.filter_by(role='CLIENT').filter(User.created_at >= week_ago).count()
+        new_users_last_week = User.query.filter_by(role='CLIENT').filter(
+            User.created_at >= (week_ago - timedelta(days=7)),
+            User.created_at < week_ago
+        ).count()
+        new_users_this_month = User.query.filter_by(role='CLIENT').filter(User.created_at >= month_ago).count()
+        new_users_last_month = User.query.filter_by(role='CLIENT').filter(
+            User.created_at >= (month_ago - timedelta(days=30)),
+            User.created_at < month_ago
+        ).count()
+        
+        # Платежи за периоды для сравнения
+        payments_today = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= today
+        ).count()
+        payments_yesterday = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= yesterday,
+            Payment.created_at < today
+        ).count()
+        payments_this_week = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= week_ago
+        ).count()
+        payments_last_week = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= (week_ago - timedelta(days=7)),
+            Payment.created_at < week_ago
+        ).count()
+        
+        # Доходы за периоды
+        today_payments = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= today
+        ).all()
+        revenue_today = {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+        for payment in today_payments:
+            currency = payment.currency or 'USD'
+            if currency in revenue_today:
+                revenue_today[currency] += float(payment.amount or 0)
+        
+        yesterday_payments = Payment.query.filter(
+            Payment.status == 'PAID',
+            Payment.created_at >= yesterday,
+            Payment.created_at < today
+        ).all()
+        revenue_yesterday = {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0}
+        for payment in yesterday_payments:
+            currency = payment.currency or 'USD'
+            if currency in revenue_yesterday:
+                revenue_yesterday[currency] += float(payment.amount or 0)
+        
+        # Расширенная статистика по триалам в выбранном периоде
+        trial_stats = {
+            'total_used': trial_users,
+            'usage_rate': trial_usage_rate,
+            'not_used': total_users - trial_users,
+            'conversion_from_trial': 0  # Сколько из триалов конвертировались в платных
+        }
+        # Пользователи, которые использовали триал и потом сделали платеж в выбранном периоде
+        trial_users_with_payments = db.session.query(User.id).join(
+            Payment, Payment.user_id == User.id
+        ).filter(
+            User.role == 'CLIENT',
+            User.trial_used == True,
+            Payment.status == 'PAID',
+            User.created_at >= stats_start_date,
+            User.created_at <= stats_end_date,
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).distinct().count()
+        trial_stats['conversion_from_trial'] = round((trial_users_with_payments / trial_users * 100), 2) if trial_users > 0 else 0
+        
+        # Детальная статистика по реферальной программе в выбранном периоде
+        referral_stats = {
+            'total_referrers': User.query.filter_by(role='CLIENT').filter(
+                User.referrer_id.isnot(None),
+                User.created_at >= stats_start_date,
+                User.created_at <= stats_end_date
+            ).count(),
+            'total_referrals': db.session.query(func.count(User.id)).filter(
+                User.role == 'CLIENT',
+                User.referrer_id.isnot(None),
+                User.created_at >= stats_start_date,
+                User.created_at <= stats_end_date
+            ).scalar(),
+            'top_referrers': []
+        }
+        
+        # Топ рефереров (пользователи с наибольшим количеством рефералов) в выбранном периоде
+        # Используем правильный способ для self-referential relationship
+        from sqlalchemy.orm import aliased
+        Referral = aliased(User)
+        
+        top_referrers_query = db.session.query(
+            User.id,
+            User.email,
+            User.telegram_username,
+            func.count(Referral.id).label('referrals_count')
+        ).join(
+            Referral, Referral.referrer_id == User.id
+        ).filter(
+            User.role == 'CLIENT',
+            Referral.role == 'CLIENT',
+            Referral.created_at >= stats_start_date,
+            Referral.created_at <= stats_end_date
+        ).group_by(
+            User.id, User.email, User.telegram_username
+        ).order_by(
+            func.count(Referral.id).desc()
+        ).limit(10).all()
+        
+        referral_stats['top_referrers'] = [
+            {
+                'id': ref_id,
+                'email': email or 'N/A',
+                'telegram_username': telegram_username,
+                'referrals_count': count
+            }
+            for ref_id, email, telegram_username, count in top_referrers_query
+        ]
+        
+        # Воронка конверсии (уже использует отфильтрованные данные)
+        conversion_funnel = {
+            'registrations': total_users,
+            'verified': verified_users,
+            'with_telegram': users_with_telegram,
+            'used_trial': trial_users,
+            'made_payment': successful_payments,
+            'active_subscription': users_with_configs
+        }
+        
+        # Проценты конверсии на каждом этапе
+        conversion_funnel['rates'] = {
+            'verification_rate': round((verified_users / total_users * 100), 2) if total_users > 0 else 0,
+            'telegram_rate': round((users_with_telegram / total_users * 100), 2) if total_users > 0 else 0,
+            'trial_rate': round((trial_users / total_users * 100), 2) if total_users > 0 else 0,
+            'payment_rate': round((successful_payments / total_users * 100), 2) if total_users > 0 else 0,
+            'subscription_rate': round((users_with_configs / total_users * 100), 2) if total_users > 0 else 0
+        }
+        
+        # Топ пользователей по тратам (по валютам отдельно) в выбранном периоде
+        top_users_by_spending = db.session.query(
+            User.id,
+            User.email,
+            User.telegram_username,
+            Payment.currency,
+            func.sum(Payment.amount).label('total_spent'),
+            func.count(Payment.id).label('payments_count')
+        ).join(
+            Payment, Payment.user_id == User.id
+        ).filter(
+            User.role == 'CLIENT',
+            Payment.status == 'PAID',
+            Payment.created_at >= stats_start_date,
+            Payment.created_at <= stats_end_date
+        ).group_by(
+            User.id, User.email, User.telegram_username, Payment.currency
+        ).order_by(
+            func.sum(Payment.amount).desc()
+        ).all()
+        
+        # Группируем по пользователям и валютам
+        users_dict = {}
+        for user_id, email, telegram_username, currency, total_spent, payments_count in top_users_by_spending:
+            if user_id not in users_dict:
+                users_dict[user_id] = {
+                    'id': user_id,
+                    'email': email or 'N/A',
+                    'telegram_username': telegram_username,
+                    'spending_by_currency': {'USD': 0.0, 'UAH': 0.0, 'RUB': 0.0},
+                    'payments_count': 0
+                }
+            if currency in users_dict[user_id]['spending_by_currency']:
+                users_dict[user_id]['spending_by_currency'][currency] += float(total_spent) if total_spent else 0.0
+            users_dict[user_id]['payments_count'] += payments_count
+        
+        # Сортируем по общей сумме (сумма всех валют)
+        top_users = sorted(
+            [
+                {
+                    **user_data,
+                    'total_spent': sum(user_data['spending_by_currency'].values())
+                }
+                for user_data in users_dict.values()
+            ],
+            key=lambda x: x['total_spent'],
+            reverse=True
+        )[:20]
+        
+        return jsonify({
+            'overview': {
+                'total_users': total_users,
+                'verified_users': verified_users,
+                'users_with_telegram': users_with_telegram,
+                'total_configs': total_configs,
+                'users_with_configs': users_with_configs,
+                'total_payments': total_payments,
+                'successful_payments': successful_payments,
+                'payment_success_rate': round(successful_payments / total_payments * 100, 2) if total_payments > 0 else 0,
+                'total_revenue': total_revenue,
+                # Новые метрики
+                'arpu_by_currency': arpu_by_currency,  # Average Revenue Per User по валютам
+                'avg_payment_by_currency': avg_payment_by_currency,  # Средний чек по валютам
+                'conversion_rate': conversion_rate,  # Конверсия регистраций в платежи
+                'trial_users': trial_users,
+                'trial_usage_rate': trial_usage_rate,
+                'users_with_referrer': users_with_referrer,
+                'referral_rate': referral_rate
+            },
+            'revenue_by_period': revenue_by_period,
+            'user_registrations_by_period': user_registrations_by_period,
+            'payments_by_period': payments_by_period,
+            'payment_providers': payment_providers,
+            'tariffs_analytics': tariffs_analytics,
+            'promocodes_analytics': promocodes_analytics,
+            'comparison': {
+                'users': {
+                    'today': new_users_today,
+                    'yesterday': new_users_yesterday,
+                    'this_week': new_users_this_week,
+                    'last_week': new_users_last_week,
+                    'this_month': new_users_this_month,
+                    'last_month': new_users_last_month
+                },
+                'payments': {
+                    'today': payments_today,
+                    'yesterday': payments_yesterday,
+                    'this_week': payments_this_week,
+                    'last_week': payments_last_week
+                },
+                'revenue': {
+                    'today': revenue_today,
+                    'yesterday': revenue_yesterday
+                }
+            },
+            'trial_stats': trial_stats,
+            'referral_stats': referral_stats,
+            'conversion_funnel': conversion_funnel,
+            'top_users': top_users,
+            'custom_date_range': custom_date_range is not None,
+            'period': period
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_analytics: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal Server Error", "error": str(e)}), 500
 
 
 @app.route('/api/admin/sales', methods=['GET'])
@@ -1242,11 +2303,16 @@ def admin_bot_config_endpoint(current_admin):
         db.session.commit()
     
     if request.method == 'GET':
+        default_buttons_order = ["trial", "connect", "status", "tariffs", "options", "referrals", "support", "settings", "webapp"]
         return jsonify({
             "service_name": config.service_name or "StealthNET",
             "bot_username": config.bot_username or "",
             "support_url": config.support_url or "",
             "support_bot_username": config.support_bot_username or "",
+            "show_connect_button": getattr(config, 'show_connect_button', True) if getattr(config, 'show_connect_button', None) is not None else True,
+            "show_status_button": getattr(config, 'show_status_button', True) if getattr(config, 'show_status_button', None) is not None else True,
+            "show_tariffs_button": getattr(config, 'show_tariffs_button', True) if getattr(config, 'show_tariffs_button', None) is not None else True,
+            "show_options_button": getattr(config, 'show_options_button', True) if getattr(config, 'show_options_button', None) is not None else True,
             "show_webapp_button": config.show_webapp_button if config.show_webapp_button is not None else True,
             "show_trial_button": config.show_trial_button if config.show_trial_button is not None else True,
             "show_referral_button": config.show_referral_button if config.show_referral_button is not None else True,
@@ -1255,6 +2321,7 @@ def admin_bot_config_endpoint(current_admin):
             "show_agreement_button": config.show_agreement_button if config.show_agreement_button is not None else True,
             "show_offer_button": config.show_offer_button if config.show_offer_button is not None else True,
             "show_topup_button": config.show_topup_button if config.show_topup_button is not None else True,
+            "show_settings_button": getattr(config, 'show_settings_button', True) if getattr(config, 'show_settings_button', None) is not None else True,
             "trial_days": config.trial_days or 3,
             "translations_ru": json.loads(config.translations_ru) if config.translations_ru else {},
             "translations_ua": json.loads(config.translations_ua) if config.translations_ua else {},
@@ -1280,7 +2347,7 @@ def admin_bot_config_endpoint(current_admin):
             "channel_subscription_text_en": getattr(config, 'channel_subscription_text_en', '') or "",
             "channel_subscription_text_cn": getattr(config, 'channel_subscription_text_cn', '') or "",
             "bot_link_for_miniapp": getattr(config, 'bot_link_for_miniapp', '') or "",
-            "buttons_order": json.loads(config.buttons_order) if hasattr(config, 'buttons_order') and config.buttons_order else [],
+            "buttons_order": json.loads(config.buttons_order) if hasattr(config, 'buttons_order') and config.buttons_order else default_buttons_order,
             "updated_at": config.updated_at.isoformat() if config.updated_at else None
         }), 200
     
@@ -1289,6 +2356,7 @@ def admin_bot_config_endpoint(current_admin):
         
         # Булевые поля, которые должны быть правильно обработаны
         boolean_fields = {
+            'show_connect_button', 'show_status_button', 'show_tariffs_button', 'show_options_button', 'show_settings_button',
             'show_webapp_button', 'show_trial_button', 'show_referral_button',
             'show_support_button', 'show_servers_button', 'show_agreement_button',
             'show_offer_button', 'show_topup_button', 'require_channel_subscription'
@@ -1296,6 +2364,7 @@ def admin_bot_config_endpoint(current_admin):
         
         # Простые поля
         simple_fields = ['service_name', 'bot_username', 'support_url', 'support_bot_username',
+                        'show_connect_button', 'show_status_button', 'show_tariffs_button', 'show_options_button', 'show_settings_button',
                         'show_webapp_button', 'show_trial_button', 'show_referral_button',
                         'show_support_button', 'show_servers_button', 'show_agreement_button',
                         'show_offer_button', 'show_topup_button', 'trial_days',
@@ -1409,12 +2478,23 @@ def create_tariff(current_admin):
             if field not in data:
                 return jsonify({"message": f"Field {field} is required"}), 400
 
+        # Валидируем tier (если передан)
+        tier = data.get('tier')
+        if tier is not None and str(tier).strip() != '':
+            tier_code = str(tier).strip().lower()
+            level = TariffLevel.query.filter_by(code=tier_code, is_active=True).first()
+            if not level:
+                return jsonify({"message": f"Unknown tariff level: {tier_code}"}), 400
+            tier = tier_code
+        else:
+            tier = None
+
         tariff = Tariff(
             name=data['name'], duration_days=data['duration_days'],
             price_uah=data['price_uah'], price_rub=data['price_rub'], price_usd=data['price_usd'],
             squad_id=data.get('squad_id'),  # Для обратной совместимости
             traffic_limit_bytes=data.get('traffic_limit_bytes', 0),
-            hwid_device_limit=data.get('hwid_device_limit', 0), tier=data.get('tier'),
+            hwid_device_limit=data.get('hwid_device_limit', 0), tier=tier,
             badge=data.get('badge'), bonus_days=data.get('bonus_days', 0)
         )
         
@@ -1476,7 +2556,18 @@ def update_tariff(current_admin, tariff_id=None, id=None):
                   'squad_id', 'traffic_limit_bytes', 'hwid_device_limit', 'tier', 'badge', 'bonus_days']
         for field in fields:
             if field in data:
-                setattr(tariff, field, data[field])
+                if field == 'tier':
+                    tier = data.get('tier')
+                    if tier is None or str(tier).strip() == '':
+                        setattr(tariff, 'tier', None)
+                    else:
+                        tier_code = str(tier).strip().lower()
+                        level = TariffLevel.query.filter_by(code=tier_code, is_active=True).first()
+                        if not level:
+                            return jsonify({"message": f"Unknown tariff level: {tier_code}"}), 400
+                        setattr(tariff, 'tier', tier_code)
+                else:
+                    setattr(tariff, field, data[field])
         
         # Обрабатываем squad_ids отдельно
         if 'squad_ids' in data:
@@ -1573,6 +2664,186 @@ def delete_tariff(current_admin, tariff_id=None, id=None):
         return jsonify({
             "message": f"Internal Server Error: {str(e)}"
         }), 500
+
+
+# ============================================================================
+# PURCHASE OPTIONS (Дополнительные опции для покупки)
+# ============================================================================
+
+@app.route('/api/admin/options', methods=['GET'])
+@admin_required
+def get_options(current_admin):
+    """Получить список всех опций"""
+    try:
+        options = PurchaseOption.query.order_by(PurchaseOption.sort_order, PurchaseOption.id).all()
+        return jsonify([opt.to_dict() for opt in options]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/options', methods=['POST'])
+@admin_required
+def create_option(current_admin):
+    """Создать новую опцию"""
+    try:
+        data = request.get_json(silent=True) or {}
+
+        option = PurchaseOption(
+            option_type=data.get('option_type', 'traffic'),
+            name=data.get('name', ''),
+            description=data.get('description', ''),
+            value=str(data.get('value', '')),
+            squad_uuid=data.get('squad_uuid'),
+            unit=data.get('unit', ''),
+            price_uah=float(data.get('price_uah', 0) or 0),
+            price_rub=float(data.get('price_rub', 0) or 0),
+            price_usd=float(data.get('price_usd', 0) or 0),
+            is_active=bool(data.get('is_active', True)),
+            sort_order=int(data.get('sort_order', 0) or 0),
+            icon=data.get('icon', '📦')
+        )
+
+        db.session.add(option)
+        db.session.commit()
+
+        # Очищаем кэш публичных опций
+        try:
+            cache.delete('flask_cache_view//api/public/options')
+            cache.delete('view//api/public/options')
+            cache.delete('public_options')
+            cache.delete('flask_cache_view//api/public/purchase-options')
+            cache.delete('view//api/public/purchase-options')
+            cache.delete('public_purchase_options_grouped')
+        except Exception:
+            pass
+
+        return jsonify(option.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/options/<int:option_id>', methods=['GET'])
+@admin_required
+def get_option(current_admin, option_id):
+    """Получить опцию по ID"""
+    try:
+        option = PurchaseOption.query.get(option_id)
+        if not option:
+            return jsonify({"error": "Option not found"}), 404
+        return jsonify(option.to_dict()), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/options/<int:option_id>', methods=['PUT'])
+@admin_required
+def update_option(current_admin, option_id):
+    """Обновить опцию"""
+    try:
+        option = PurchaseOption.query.get(option_id)
+        if not option:
+            return jsonify({"error": "Option not found"}), 404
+
+        data = request.get_json(silent=True) or {}
+
+        if 'option_type' in data:
+            option.option_type = data['option_type']
+        if 'name' in data:
+            option.name = data['name']
+        if 'description' in data:
+            option.description = data['description']
+        if 'value' in data:
+            option.value = str(data['value'])
+        if 'squad_uuid' in data:
+            option.squad_uuid = data['squad_uuid']
+        if 'unit' in data:
+            option.unit = data['unit']
+        if 'price_uah' in data:
+            option.price_uah = float(data['price_uah'] or 0)
+        if 'price_rub' in data:
+            option.price_rub = float(data['price_rub'] or 0)
+        if 'price_usd' in data:
+            option.price_usd = float(data['price_usd'] or 0)
+        if 'is_active' in data:
+            option.is_active = bool(data['is_active'])
+        if 'sort_order' in data:
+            option.sort_order = int(data['sort_order'] or 0)
+        if 'icon' in data:
+            option.icon = data['icon']
+
+        db.session.commit()
+
+        try:
+            cache.delete('flask_cache_view//api/public/options')
+            cache.delete('view//api/public/options')
+            cache.delete('public_options')
+            cache.delete('flask_cache_view//api/public/purchase-options')
+            cache.delete('view//api/public/purchase-options')
+            cache.delete('public_purchase_options_grouped')
+        except Exception:
+            pass
+
+        return jsonify(option.to_dict()), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/options/<int:option_id>', methods=['DELETE'])
+@admin_required
+def delete_option(current_admin, option_id):
+    """Удалить опцию"""
+    try:
+        option = PurchaseOption.query.get(option_id)
+        if not option:
+            return jsonify({"error": "Option not found"}), 404
+
+        db.session.delete(option)
+        db.session.commit()
+
+        try:
+            cache.delete('flask_cache_view//api/public/options')
+            cache.delete('view//api/public/options')
+            cache.delete('public_options')
+            cache.delete('flask_cache_view//api/public/purchase-options')
+            cache.delete('view//api/public/purchase-options')
+            cache.delete('public_purchase_options_grouped')
+        except Exception:
+            pass
+
+        return jsonify({"message": "Option deleted"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/options/<int:option_id>/toggle', methods=['POST'])
+@admin_required
+def toggle_option(current_admin, option_id):
+    """Включить/выключить опцию"""
+    try:
+        option = PurchaseOption.query.get(option_id)
+        if not option:
+            return jsonify({"error": "Option not found"}), 404
+
+        option.is_active = not option.is_active
+        db.session.commit()
+
+        try:
+            cache.delete('flask_cache_view//api/public/options')
+            cache.delete('view//api/public/options')
+            cache.delete('public_options')
+            cache.delete('flask_cache_view//api/public/purchase-options')
+            cache.delete('view//api/public/purchase-options')
+            cache.delete('public_purchase_options_grouped')
+        except Exception:
+            pass
+
+        return jsonify(option.to_dict()), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 
 # ============================================================================
@@ -1749,6 +3020,127 @@ def public_trial_settings():
 
 
 # ============================================================================
+# TARIFF LEVELS
+# ============================================================================
+
+@app.route('/api/admin/tariff-levels', methods=['GET', 'POST'])
+@admin_required
+def tariff_levels_settings(current_admin):
+    """Управление уровнями тарифов"""
+    if request.method == 'GET':
+        levels = TariffLevel.query.filter_by(is_active=True).order_by(TariffLevel.display_order, TariffLevel.id).all()
+        return jsonify([level.to_dict() for level in levels]), 200
+
+    try:
+        data = request.json or {}
+        action = data.get('action')
+
+        if action == 'create':
+            code = (data.get('code') or '').strip().lower()
+            name = (data.get('name') or '').strip()
+
+            if not code or not name:
+                return jsonify({"message": "Code and name are required"}), 400
+
+            existing = TariffLevel.query.filter_by(code=code).first()
+            if existing:
+                return jsonify({"message": f"Level with code '{code}' already exists"}), 400
+
+            max_order = db.session.query(db.func.max(TariffLevel.display_order)).scalar() or 0
+            level = TariffLevel(
+                code=code,
+                name=name,
+                display_order=max_order + 1,
+                is_default=False,
+                is_active=True
+            )
+            db.session.add(level)
+            db.session.commit()
+
+            # Очищаем кэш публичного списка уровней/фич
+            try:
+                cache.delete('flask_cache_view//api/public/tariff-levels')
+                cache.delete('view//api/public/tariff-levels')
+                cache.delete('get_public_tariff_levels')
+                cache.delete('flask_cache_view//api/public/tariff-features')
+                cache.delete('view//api/public/tariff-features')
+                cache.delete('get_public_tariff_features')
+            except Exception:
+                pass
+
+            return jsonify({"message": "Tariff level created successfully", "level": level.to_dict()}), 201
+
+        if action == 'update':
+            level_id = data.get('id')
+            if not level_id:
+                return jsonify({"message": "ID is required"}), 400
+
+            level = TariffLevel.query.get(level_id)
+            if not level:
+                return jsonify({"message": "Level not found"}), 404
+
+            if 'name' in data:
+                level.name = (data.get('name') or '').strip()
+            if 'display_order' in data:
+                level.display_order = int(data.get('display_order') or 0)
+            if 'is_active' in data:
+                level.is_active = bool(data.get('is_active'))
+
+            db.session.commit()
+
+            try:
+                cache.delete('flask_cache_view//api/public/tariff-levels')
+                cache.delete('view//api/public/tariff-levels')
+                cache.delete('get_public_tariff_levels')
+                cache.delete('flask_cache_view//api/public/tariff-features')
+                cache.delete('view//api/public/tariff-features')
+                cache.delete('get_public_tariff_features')
+            except Exception:
+                pass
+
+            return jsonify({"message": "Tariff level updated successfully", "level": level.to_dict()}), 200
+
+        if action == 'delete':
+            level_id = data.get('id')
+            if not level_id:
+                return jsonify({"message": "ID is required"}), 400
+
+            level = TariffLevel.query.get(level_id)
+            if not level:
+                return jsonify({"message": "Level not found"}), 404
+
+            if level.is_default:
+                return jsonify({"message": "Cannot delete default level"}), 400
+
+            tariffs_count = Tariff.query.filter_by(tier=level.code).count()
+            if tariffs_count > 0:
+                return jsonify({"message": f"Cannot delete level: {tariffs_count} tariff(s) are using it"}), 400
+
+            level.is_active = False
+            db.session.commit()
+
+            try:
+                cache.delete('flask_cache_view//api/public/tariff-levels')
+                cache.delete('view//api/public/tariff-levels')
+                cache.delete('get_public_tariff_levels')
+                cache.delete('flask_cache_view//api/public/tariff-features')
+                cache.delete('view//api/public/tariff-features')
+                cache.delete('get_public_tariff_features')
+            except Exception:
+                pass
+
+            return jsonify({"message": "Tariff level deleted successfully"}), 200
+
+        return jsonify({"message": "Invalid action"}), 400
+
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to process request: {str(e)}"}), 500
+
+
+# ============================================================================
 # TARIFF FEATURES
 # ============================================================================
 
@@ -1763,26 +3155,31 @@ def tariff_features_settings(current_admin):
     }
     
     if request.method == 'GET':
+        levels = TariffLevel.query.filter_by(is_active=True).order_by(TariffLevel.display_order, TariffLevel.id).all()
         result = {}
-        for tier in ['basic', 'pro', 'elite']:
-            setting = TariffFeatureSetting.query.filter_by(tier=tier).first()
+        for level in levels:
+            setting = TariffFeatureSetting.query.filter_by(tier=level.code).first()
             if setting:
                 try:
-                    result[tier] = json.loads(setting.features) if isinstance(setting.features, str) else setting.features
-                except:
-                    result[tier] = default_features[tier]
+                    parsed = json.loads(setting.features) if isinstance(setting.features, str) else setting.features
+                    result[level.code] = parsed if isinstance(parsed, list) else default_features.get(level.code, [])
+                except Exception:
+                    result[level.code] = default_features.get(level.code, [])
             else:
-                result[tier] = default_features[tier]
+                result[level.code] = default_features.get(level.code, [])
         return jsonify(result), 200
     
     try:
-        data = request.json
-        for tier, features in data.items():
-            if tier not in ['basic', 'pro', 'elite']:
+        data = request.json or {}
+        for tier_code, features in data.items():
+            # Пропускаем несуществующие/неактивные уровни
+            level = TariffLevel.query.filter_by(code=tier_code, is_active=True).first()
+            if not level:
                 continue
-            setting = TariffFeatureSetting.query.filter_by(tier=tier).first()
+
+            setting = TariffFeatureSetting.query.filter_by(tier=tier_code).first()
             if not setting:
-                setting = TariffFeatureSetting(tier=tier)
+                setting = TariffFeatureSetting(tier=tier_code)
                 db.session.add(setting)
             setting.features = json.dumps(features, ensure_ascii=False) if isinstance(features, list) else features
         db.session.commit()
@@ -1791,6 +3188,10 @@ def tariff_features_settings(current_admin):
         cache.delete('flask_cache_view//api/public/tariff-features')
         cache.delete('view//api/public/tariff-features')
         cache.delete('get_public_tariff_features')
+        # Также очищаем кэш уровней, т.к. фичи завязаны на уровни
+        cache.delete('flask_cache_view//api/public/tariff-levels')
+        cache.delete('view//api/public/tariff-levels')
+        cache.delete('get_public_tariff_levels')
         # Также очищаем все ключи с 'tariff-feature' в названии через Redis напрямую
         try:
             import redis
@@ -1799,7 +3200,7 @@ def tariff_features_settings(current_admin):
             redis_db = int(os.getenv("REDIS_DB", 0))
             redis_password = os.getenv("REDIS_PASSWORD", None)
             r = redis.Redis(host=redis_host, port=redis_port, db=redis_db, password=redis_password, decode_responses=True)
-            keys = r.keys('*tariff-feature*')
+            keys = r.keys('*tariff-feature*') + r.keys('*tariff-level*')
             if keys:
                 r.delete(*keys)
                 print(f"[CACHE] Deleted {len(keys)} tariff-feature cache keys")
@@ -2546,18 +3947,22 @@ def get_default_translations(current_admin):
             "traffic_title": "Трафик",
             "unlimited_traffic": "Безлимитный",
             "days": "дней",
-            "connect_button": "Подключиться",
+            "connect_button": "Подключиться к VPN",
             "activate_trial_button": "Активировать триал",
-            "status_button": "Статус подписки",
+            "status_button": "Моя подписка",
             "tariffs_button": "Тарифы",
+            "options_button": "Опции",
             "servers_button": "Серверы",
-            "referrals_button": "Рефералы",
+            "referrals_button": "Рефералка",
             "support_button": "Поддержка",
+            "support_bot_button": "Бот Поддержки",
+            "administration_button": "Администрация",
             "settings_button": "Настройки",
             "top_up_balance": "Пополнить баланс",
-            "cabinet_button": "Кабинет",
+            "cabinet_button": "Web Кабинет",
             "webapp_button": "Web-приложение",
-            "agreement_button": "Согласие",
+            "user_agreement_button": "Соглашение",
+            "agreement_button": "Соглашение",
             "offer_button": "Оферта"
         },
         "en": {
@@ -2575,17 +3980,21 @@ def get_default_translations(current_admin):
             "traffic_title": "Traffic",
             "unlimited_traffic": "Unlimited",
             "days": "days",
-            "connect_button": "Connect",
+            "connect_button": "Connect to VPN",
             "activate_trial_button": "Activate Trial",
-            "status_button": "Subscription Status",
+            "status_button": "My Subscription",
             "tariffs_button": "Tariffs",
+            "options_button": "Options",
             "servers_button": "Servers",
             "referrals_button": "Referrals",
             "support_button": "Support",
+            "support_bot_button": "Support Bot",
+            "administration_button": "Administration",
             "settings_button": "Settings",
             "top_up_balance": "Top Up Balance",
-            "cabinet_button": "Cabinet",
+            "cabinet_button": "Web Cabinet",
             "webapp_button": "Web App",
+            "user_agreement_button": "Agreement",
             "agreement_button": "Agreement",
             "offer_button": "Offer"
         },
@@ -2604,17 +4013,21 @@ def get_default_translations(current_admin):
             "traffic_title": "Трафік",
             "unlimited_traffic": "Безлімітний",
             "days": "днів",
-            "connect_button": "Підключитися",
+            "connect_button": "Підключитися до VPN",
             "activate_trial_button": "Активувати тріал",
-            "status_button": "Статус підписки",
+            "status_button": "Моя підписка",
             "tariffs_button": "Тарифи",
+            "options_button": "Опції",
             "servers_button": "Сервери",
-            "referrals_button": "Реферали",
+            "referrals_button": "Рефералка",
             "support_button": "Підтримка",
+            "support_bot_button": "Бот Підтримки",
+            "administration_button": "Адміністрація",
             "settings_button": "Налаштування",
             "top_up_balance": "Поповнити баланс",
-            "cabinet_button": "Кабінет",
+            "cabinet_button": "Web Кабінет",
             "webapp_button": "Web-додаток",
+            "user_agreement_button": "Угода",
             "agreement_button": "Угода",
             "offer_button": "Оферта"
         },
@@ -2633,17 +4046,21 @@ def get_default_translations(current_admin):
             "traffic_title": "流量",
             "unlimited_traffic": "无限制",
             "days": "天",
-            "connect_button": "连接",
+            "connect_button": "连接VPN",
             "activate_trial_button": "激活试用",
-            "status_button": "订阅状态",
+            "status_button": "我的订阅",
             "tariffs_button": "资费",
+            "options_button": "选项",
             "servers_button": "服务器",
             "referrals_button": "推荐",
             "support_button": "支持",
+            "support_bot_button": "支持机器人",
+            "administration_button": "管理",
             "settings_button": "设置",
             "top_up_balance": "充值",
-            "cabinet_button": "控制面板",
+            "cabinet_button": "Web кабинет",
             "webapp_button": "Web应用",
+            "user_agreement_button": "协议",
             "agreement_button": "协议",
             "offer_button": "报价"
         }
@@ -2736,3 +4153,7 @@ def telegram_set_webhook(current_admin):
     except Exception as e:
         print(f"Telegram set webhook error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+# Import side-effect routes (e.g. SSH terminal)
+from modules.api.admin import ssh_terminal  # noqa: F401

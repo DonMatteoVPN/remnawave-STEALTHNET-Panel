@@ -22,10 +22,12 @@ import os
 from modules.core import get_app, get_db, get_cache
 from modules.models.tariff import Tariff
 from modules.models.tariff_feature import TariffFeatureSetting
+from modules.models.tariff_level import TariffLevel
 from modules.models.system import SystemSetting
 from modules.models.branding import BrandingSetting
 from modules.models.bot_config import BotConfig
 from modules.models.currency import CurrencyRate
+from modules.models.option import PurchaseOption
 
 app = get_app()
 db = get_db()
@@ -80,16 +82,154 @@ def public_tariffs():
         return jsonify({"message": "Internal Server Error"}), 500
 
 
+@app.route('/api/public/tariff-levels', methods=['GET'])
+@cache.cached(timeout=3600)
+def get_public_tariff_levels():
+    """Публичные уровни тарифов"""
+    try:
+        levels = TariffLevel.query.filter_by(is_active=True).order_by(TariffLevel.display_order, TariffLevel.id).all()
+        return jsonify([level.to_dict() for level in levels]), 200
+    except Exception as e:
+        print(f"Error in get_public_tariff_levels: {e}")
+        # Фолбэк для инстансов, где миграция ещё не применена
+        return jsonify([
+            {"id": 1, "code": "basic", "name": "Базовый", "display_order": 1, "is_default": True, "is_active": True},
+            {"id": 2, "code": "pro", "name": "Премиум", "display_order": 2, "is_default": True, "is_active": True},
+            {"id": 3, "code": "elite", "name": "Элитный", "display_order": 3, "is_default": True, "is_active": True},
+        ]), 200
+
+
 @app.route('/api/public/tariff-features', methods=['GET'])
 @cache.cached(timeout=3600)
 def get_public_tariff_features():
     """Публичные функции тарифов"""
-    features = TariffFeatureSetting.query.all()
-    return jsonify([{
-        "id": f.id,
-        "tier": f.tier,
-        "features": f.features
-    } for f in features]), 200
+    default_features = {
+        'basic': ['Безлимитный трафик', 'До 5 устройств', 'Базовый анти-DPI'],
+        'pro': ['Приоритетная скорость', 'До 10 устройств', 'Ротация IP'],
+        'elite': ['VIP-поддержка 24/7', 'Статический IP', 'Автообновление']
+    }
+
+    # Возвращаем словарь {tier_code: [features...]} по активным уровням
+    try:
+        levels = TariffLevel.query.filter_by(is_active=True).order_by(TariffLevel.display_order, TariffLevel.id).all()
+        level_codes = [l.code for l in levels if getattr(l, 'code', None)]
+    except Exception as e:
+        print(f"Error loading TariffLevel for features: {e}")
+        level_codes = []
+
+    if not level_codes:
+        level_codes = ['basic', 'pro', 'elite']
+
+    result = {}
+
+    for code in level_codes:
+        setting = TariffFeatureSetting.query.filter_by(tier=code).first()
+        if setting:
+            try:
+                parsed = json.loads(setting.features) if isinstance(setting.features, str) else setting.features
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    result[code] = parsed
+                else:
+                    result[code] = default_features.get(code, [])
+            except Exception:
+                result[code] = default_features.get(code, [])
+        else:
+            result[code] = default_features.get(code, [])
+
+    return jsonify(result), 200
+
+
+# ============================================================================
+# PURCHASE OPTIONS (Дополнительные опции для покупки)
+# ============================================================================
+
+@app.route('/api/public/options', methods=['GET'])
+def public_options():
+    """Публичный список активных опций"""
+    try:
+        options = PurchaseOption.query.filter_by(is_active=True).order_by(
+            PurchaseOption.sort_order,
+            PurchaseOption.id
+        ).all()
+
+        return jsonify([{
+            'id': opt.id,
+            'option_type': opt.option_type,
+            'name': opt.name,
+            'description': opt.description,
+            'value': opt.value,
+            'unit': opt.unit,
+            'price_uah': opt.price_uah,
+            'price_rub': opt.price_rub,
+            'price_usd': opt.price_usd,
+            'icon': opt.icon
+        } for opt in options]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/public/options/<option_type>', methods=['GET'])
+def public_options_by_type(option_type):
+    """Публичный список активных опций по типу"""
+    try:
+        options = PurchaseOption.query.filter_by(
+            is_active=True,
+            option_type=option_type
+        ).order_by(
+            PurchaseOption.sort_order,
+            PurchaseOption.id
+        ).all()
+
+        return jsonify([{
+            'id': opt.id,
+            'option_type': opt.option_type,
+            'name': opt.name,
+            'description': opt.description,
+            'value': opt.value,
+            'unit': opt.unit,
+            'price_uah': opt.price_uah,
+            'price_rub': opt.price_rub,
+            'price_usd': opt.price_usd,
+            'icon': opt.icon
+        } for opt in options]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/public/purchase-options', methods=['GET'])
+def public_purchase_options_grouped():
+    """Публичный список опций для покупки (сгруппированный по типу)"""
+    try:
+        options = PurchaseOption.query.filter_by(is_active=True).order_by(
+            PurchaseOption.sort_order,
+            PurchaseOption.id
+        ).all()
+
+        result = {
+            'traffic': [],
+            'devices': [],
+            'squad': []
+        }
+
+        for opt in options:
+            option_data = {
+                'id': opt.id,
+                'option_type': opt.option_type,
+                'name': opt.name,
+                'description': opt.description,
+                'value': opt.value,
+                'unit': opt.unit,
+                'price_uah': opt.price_uah,
+                'price_rub': opt.price_rub,
+                'price_usd': opt.price_usd,
+                'icon': opt.icon
+            }
+            if opt.option_type in result:
+                result[opt.option_type].append(option_data)
+
+        return jsonify({'options': result}), 200
+    except Exception as e:
+        return jsonify({"error": str(e), "options": {"traffic": [], "devices": [], "squad": []}}), 500
 
 
 # ============================================================================
@@ -397,6 +537,12 @@ def public_bot_config():
         return jsonify({
             "service_name": "StealthNET",
             "bot_username": bot_username,  # Используем из .env если есть
+            "support_url": "",
+            "support_bot_username": "",
+            "show_connect_button": True,
+            "show_status_button": True,
+            "show_tariffs_button": True,
+            "show_options_button": True,
             "show_webapp_button": True,
             "show_trial_button": True,
             "show_referral_button": True,
@@ -405,6 +551,7 @@ def public_bot_config():
             "show_agreement_button": True,
             "show_offer_button": True,
             "show_topup_button": True,
+            "show_settings_button": True,
             "trial_days": 3,
             "translations": {},
             "welcome_messages": {},
@@ -416,7 +563,7 @@ def public_bot_config():
             "channel_url": "",
             "channel_subscription_texts": {"ru": "", "ua": "", "en": "", "cn": ""},
             "bot_link_for_miniapp": "",
-            "buttons_order": ["connect", "trial", "status", "tariffs", "topup", "servers", "referrals", "support", "settings", "agreement", "offer", "webapp"]
+            "buttons_order": ["trial", "connect", "status", "tariffs", "options", "referrals", "support", "settings", "webapp"]
         }), 200
     
     # Все переводы в одном объекте (как в старом коде app.py)
@@ -460,6 +607,12 @@ def public_bot_config():
     return jsonify({
         "service_name": config.service_name or "StealthNET",
         "bot_username": bot_username,  # Добавлено для deep links
+        "support_url": (config.support_url or "").strip(),
+        "support_bot_username": (config.support_bot_username or "").lstrip("@").strip(),
+        "show_connect_button": getattr(config, 'show_connect_button', True) if getattr(config, 'show_connect_button', None) is not None else True,
+        "show_status_button": getattr(config, 'show_status_button', True) if getattr(config, 'show_status_button', None) is not None else True,
+        "show_tariffs_button": getattr(config, 'show_tariffs_button', True) if getattr(config, 'show_tariffs_button', None) is not None else True,
+        "show_options_button": getattr(config, 'show_options_button', True) if getattr(config, 'show_options_button', None) is not None else True,
         "show_webapp_button": config.show_webapp_button if config.show_webapp_button is not None else True,
         "show_trial_button": config.show_trial_button if config.show_trial_button is not None else True,
         "show_referral_button": config.show_referral_button if config.show_referral_button is not None else True,
@@ -468,6 +621,7 @@ def public_bot_config():
         "show_agreement_button": config.show_agreement_button if config.show_agreement_button is not None else True,
         "show_offer_button": config.show_offer_button if config.show_offer_button is not None else True,
         "show_topup_button": config.show_topup_button if config.show_topup_button is not None else True,
+        "show_settings_button": getattr(config, 'show_settings_button', True) if getattr(config, 'show_settings_button', None) is not None else True,
         "trial_days": config.trial_days or 3,
         "translations": translations,
         "welcome_messages": welcome_messages,
@@ -479,7 +633,7 @@ def public_bot_config():
         "channel_url": config.channel_url or "",
         "channel_subscription_texts": channel_subscription_texts if channel_subscription_texts else {"ru": "", "ua": "", "en": "", "cn": ""},
         "bot_link_for_miniapp": config.bot_link_for_miniapp or "",
-        "buttons_order": json.loads(config.buttons_order) if hasattr(config, 'buttons_order') and config.buttons_order else ["connect", "trial", "status", "tariffs", "topup", "servers", "referrals", "support", "settings", "agreement", "offer", "webapp"]
+        "buttons_order": json.loads(config.buttons_order) if hasattr(config, 'buttons_order') and config.buttons_order else ["trial", "connect", "status", "tariffs", "options", "referrals", "support", "settings", "webapp"]
     }), 200
 
 

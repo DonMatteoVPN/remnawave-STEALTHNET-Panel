@@ -88,6 +88,7 @@ class Payment(db.Model):
     telegram_message_id = db.Column(db.Integer, nullable=True)  # ID сообщения в Telegram боте о создании платежа
     user_config_id = db.Column(db.Integer, db.ForeignKey('user_config.id'), nullable=True)  # Конфиг, для которого создан платеж
     create_new_config = db.Column(db.Boolean, default=False, nullable=False)  # Флаг создания нового конфига после оплаты
+    description = db.Column(db.Text, nullable=True)  # Служебное описание (например OPTION:{option_id})
 
 
 def decrypt_key(key):

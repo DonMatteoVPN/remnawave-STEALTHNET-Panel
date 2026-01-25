@@ -3,7 +3,7 @@
 и другим общим ресурсам.
 """
 
-from flask import Flask
+from flask import Flask, current_app, has_app_context
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_caching import Cache
@@ -22,19 +22,19 @@ load_dotenv()
 app = None
 
 # Расширения Flask
-db = None
-bcrypt = None
+db = SQLAlchemy()
+bcrypt = Bcrypt()
 fernet = None
-mail = None
-cache = None
-limiter = None
+mail = Mail()
+cache = Cache()
+limiter = Limiter(get_remote_address, default_limits=["2000 per day", "500 per hour"], storage_uri="memory://")
 
 def init_app(flask_app):
     """
     Инициализация основного экземпляра Flask и всех расширений.
     Этот метод должен быть вызван из app.py.
     """
-    global app, db, bcrypt, fernet, mail, cache, limiter
+    global app, fernet
 
     app = flask_app
 
@@ -97,9 +97,11 @@ def init_app(flask_app):
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['FERNET_KEY'] = os.getenv("FERNET_KEY").encode() if os.getenv("FERNET_KEY") else None
 
-    # Инициализация расширений
-    db = SQLAlchemy(app)
-    bcrypt = Bcrypt(app)
+    # Инициализация расширений (идемпотентно: некоторые миграции вызывают init_app повторно)
+    if 'sqlalchemy' not in app.extensions:
+        db.init_app(app)
+    if 'bcrypt' not in app.extensions:
+        bcrypt.init_app(app)
     fernet = Fernet(app.config['FERNET_KEY']) if app.config.get('FERNET_KEY') else None
 
     # Конфигурация почты
@@ -115,7 +117,8 @@ def init_app(flask_app):
     else:
         app.config['MAIL_DEFAULT_SENDER'] = ('StealthNET', 'noreply@stealthnet.app')
 
-    mail = Mail(app)
+    if 'mail' not in app.extensions:
+        mail.init_app(app)
     
     # Конфигурация кэширования (Redis, FileSystemCache или null)
     cache_type = os.getenv("CACHE_TYPE", "null").lower()
@@ -144,8 +147,8 @@ def init_app(flask_app):
             test_redis.ping()
             
             # Инициализируем кэш после проверки подключения
-            cache = Cache()
-            cache.init_app(app)
+            if 'cache' not in app.extensions:
+                cache.init_app(app)
             
             # Проверяем работу кэша
             try:
@@ -180,8 +183,10 @@ def init_app(flask_app):
         app.config['CACHE_TYPE'] = 'null'
         print("⚠️  Кэширование: отключено (null cache)")
     
-    cache = Cache(app)
-    limiter = Limiter(get_remote_address, app=app, default_limits=["2000 per day", "500 per hour"], storage_uri="memory://")
+    if 'cache' not in app.extensions:
+        cache.init_app(app)
+    if 'limiter' not in app.extensions:
+        limiter.init_app(app)
 
     # CORS
     # Временно отключаем CORS для отладки
@@ -199,19 +204,21 @@ def init_app(flask_app):
 
 def get_app():
     """Возвращает основной экземпляр Flask"""
+    if has_app_context():
+        return current_app._get_current_object()
     if app is None:
         raise RuntimeError("Flask app not initialized. Call init_app() first.")
     return app
 
 def get_db():
     """Возвращает экземпляр SQLAlchemy"""
-    if db is None:
+    if not has_app_context() and app is None:
         raise RuntimeError("Database not initialized. Call init_app() first.")
     return db
 
 def get_bcrypt():
     """Возвращает экземпляр Bcrypt"""
-    if bcrypt is None:
+    if not has_app_context() and app is None:
         raise RuntimeError("Bcrypt not initialized. Call init_app() first.")
     return bcrypt
 
@@ -221,18 +228,18 @@ def get_fernet():
 
 def get_mail():
     """Возвращает экземпляр Mail"""
-    if mail is None:
+    if not has_app_context() and app is None:
         raise RuntimeError("Mail not initialized. Call init_app() first.")
     return mail
 
 def get_cache():
     """Возвращает экземпляр Cache"""
-    if cache is None:
+    if not has_app_context() and app is None:
         raise RuntimeError("Cache not initialized. Call init_app() first.")
     return cache
 
 def get_limiter():
     """Возвращает экземпляр Limiter"""
-    if limiter is None:
+    if not has_app_context() and app is None:
         raise RuntimeError("Limiter not initialized. Call init_app() first.")
     return limiter

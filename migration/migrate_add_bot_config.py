@@ -10,6 +10,7 @@ import sqlite3
 import os
 import sys
 from pathlib import Path
+import re
 
 def find_database():
     """Находит путь к базе данных"""
@@ -49,6 +50,10 @@ CREATE TABLE IF NOT EXISTS bot_config (
     support_bot_username VARCHAR(100),
     
     -- Настройки видимости кнопок
+    show_connect_button BOOLEAN DEFAULT 1 NOT NULL,
+    show_status_button BOOLEAN DEFAULT 1 NOT NULL,
+    show_tariffs_button BOOLEAN DEFAULT 1 NOT NULL,
+    show_options_button BOOLEAN DEFAULT 1 NOT NULL,
     show_webapp_button BOOLEAN DEFAULT 1 NOT NULL,
     show_trial_button BOOLEAN DEFAULT 1 NOT NULL,
     show_referral_button BOOLEAN DEFAULT 1 NOT NULL,
@@ -57,6 +62,7 @@ CREATE TABLE IF NOT EXISTS bot_config (
     show_agreement_button BOOLEAN DEFAULT 1 NOT NULL,
     show_offer_button BOOLEAN DEFAULT 1 NOT NULL,
     show_topup_button BOOLEAN DEFAULT 1 NOT NULL,
+    show_settings_button BOOLEAN DEFAULT 1 NOT NULL,
     
     -- Настройки триала
     trial_days INTEGER DEFAULT 3 NOT NULL,
@@ -109,6 +115,11 @@ CREATE TABLE IF NOT EXISTS bot_config (
 
 # Дополнительные колонки для существующей таблицы
 NEW_COLUMNS = [
+    ("show_connect_button", "BOOLEAN DEFAULT 1 NOT NULL"),
+    ("show_status_button", "BOOLEAN DEFAULT 1 NOT NULL"),
+    ("show_tariffs_button", "BOOLEAN DEFAULT 1 NOT NULL"),
+    ("show_options_button", "BOOLEAN DEFAULT 1 NOT NULL"),
+    ("show_settings_button", "BOOLEAN DEFAULT 1 NOT NULL"),
     ("require_channel_subscription", "BOOLEAN DEFAULT 0 NOT NULL"),
     ("channel_id", "VARCHAR(100)"),
     ("channel_url", "VARCHAR(500)"),
@@ -151,10 +162,12 @@ try:
                     # SQLite не поддерживает DEFAULT в ALTER TABLE для NOT NULL
                     if "NOT NULL" in col_type:
                         # Сначала добавляем без NOT NULL и DEFAULT
-                        clean_type = col_type.replace("NOT NULL", "").replace("DEFAULT 0", "").strip()
+                        default_value = 1 if re.search(r"\bDEFAULT\s+1\b", col_type) else 0
+                        clean_type = col_type.replace("NOT NULL", "")
+                        clean_type = re.sub(r"\bDEFAULT\s+\d+\b", "", clean_type).strip()
                         cursor.execute(f"ALTER TABLE bot_config ADD COLUMN {col_name} {clean_type}")
                         # Потом обновляем значение
-                        cursor.execute(f"UPDATE bot_config SET {col_name} = 0 WHERE {col_name} IS NULL")
+                        cursor.execute(f"UPDATE bot_config SET {col_name} = {default_value} WHERE {col_name} IS NULL")
                     else:
                         cursor.execute(f"ALTER TABLE bot_config ADD COLUMN {col_name} {col_type}")
                     conn.commit()
