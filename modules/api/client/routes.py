@@ -299,6 +299,35 @@ def get_client_referrals_info():
 # USER DATA
 # ============================================================================
 
+def _normalize_traffic_data(data_dict):
+    """Нормализует данные трафика из RemnaWave API для единообразного использования"""
+    if not isinstance(data_dict, dict):
+        return {}
+    
+    # Нормализуем трафик: в RemnaWave usedTraffic обычно лежит в userTraffic.usedTrafficBytes
+    used_traffic = data_dict.get('usedTrafficBytes', None)
+    if used_traffic is None:
+        ut = data_dict.get('userTraffic', {})
+        if isinstance(ut, dict):
+            used_traffic = ut.get('usedTrafficBytes', 0)
+        else:
+            used_traffic = 0
+    else:
+        used_traffic = used_traffic or 0
+    
+    traffic_limit = data_dict.get('trafficLimitBytes', 0) or 0
+    traffic_strategy = data_dict.get('trafficLimitStrategy')
+    
+    return {
+        'usedTrafficBytes': used_traffic,
+        'trafficLimitBytes': traffic_limit,
+        'trafficLimitStrategy': traffic_strategy,
+        # Для обратной совместимости
+        'traffic_used': used_traffic,
+        'traffic_limit': traffic_limit
+    }
+
+
 @app.route('/api/client/me', methods=['GET'])
 def get_client_me():
     """Получение данных текущего пользователя"""
@@ -404,6 +433,8 @@ def get_client_me():
                 cached = cached.copy()
                 balance_usd = float(user.balance) if user.balance else 0.0
                 balance_converted = convert_from_usd(balance_usd, user.preferred_currency)
+                # Нормализуем трафик
+                traffic_data = _normalize_traffic_data(cached)
                 cached.update({
                     'referral_code': user.referral_code,
                     'preferred_lang': user.preferred_lang,
@@ -412,7 +443,8 @@ def get_client_me():
                     'telegram_username': user.telegram_username,
                     'balance_usd': balance_usd,
                     'balance': balance_converted,
-                    'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
+                    'trial_used': getattr(user, 'trial_used', False),  # Добавляем информацию об использовании триала
+                    **traffic_data  # Добавляем нормализованные данные трафика
                 })
             return jsonify({"response": cached}), 200
 
@@ -437,6 +469,8 @@ def get_client_me():
                     if isinstance(cached, dict):
                         cached = cached.copy()
                         balance_usd = float(user.balance) if user.balance else 0.0
+                        # Нормализуем трафик
+                        traffic_data = _normalize_traffic_data(cached)
                         cached.update({
                             'referral_code': user.referral_code,
                             'preferred_lang': user.preferred_lang,
@@ -445,7 +479,8 @@ def get_client_me():
                             'telegram_username': user.telegram_username,
                             'balance_usd': balance_usd,
                             'balance': convert_from_usd(balance_usd, user.preferred_currency),
-                            'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
+                            'trial_used': getattr(user, 'trial_used', False),  # Добавляем информацию об использовании триала
+                            **traffic_data  # Добавляем нормализованные данные трафика
                         })
                     return jsonify({"response": cached}), 200
                 
@@ -479,6 +514,10 @@ def get_client_me():
         if isinstance(data, dict):
             balance_usd = float(user.balance) if user.balance else 0.0
             balance_converted = convert_from_usd(balance_usd, user.preferred_currency)
+            
+            # Нормализуем трафик
+            traffic_data = _normalize_traffic_data(data)
+            
             data.update({
                 'referral_code': user.referral_code,
                 'preferred_lang': user.preferred_lang,
@@ -488,7 +527,8 @@ def get_client_me():
                 'password_hash': user.password_hash if user.password_hash else '',  # Добавляем password_hash
                 'balance_usd': balance_usd,
                 'balance': balance_converted,
-                'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
+                'trial_used': getattr(user, 'trial_used', False),  # Добавляем информацию об использовании триала
+                **traffic_data  # Добавляем нормализованные данные трафика
             })
 
         cache.set(cache_key, data, timeout=300)
@@ -500,6 +540,8 @@ def get_client_me():
             if isinstance(cached, dict):
                 cached = cached.copy()
                 balance_usd = float(user.balance) if user.balance else 0.0
+                # Нормализуем трафик
+                traffic_data = _normalize_traffic_data(cached)
                 cached.update({
                     'referral_code': user.referral_code,
                     'preferred_lang': user.preferred_lang,
@@ -509,7 +551,8 @@ def get_client_me():
                     'password_hash': user.password_hash if user.password_hash else '',  # Добавляем password_hash
                     'balance_usd': balance_usd,
                     'balance': convert_from_usd(balance_usd, user.preferred_currency),
-                    'trial_used': getattr(user, 'trial_used', False)  # Добавляем информацию об использовании триала
+                    'trial_used': getattr(user, 'trial_used', False),  # Добавляем информацию об использовании триала
+                    **traffic_data  # Добавляем нормализованные данные трафика
                 })
             return jsonify({"response": cached}), 200
         return jsonify({"message": f"Ошибка подключения: {str(e)}"}), 500
